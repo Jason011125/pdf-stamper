@@ -6,6 +6,9 @@ interface StampStore {
   type: StampType;
   imagePath: string | null;
   imagePreviewUrl: string | null;
+  naturalWidthPx: number;
+  naturalHeightPx: number;
+  scalePercent: number;
   text: string;
   fontFamily: string;
   fontSize: number;
@@ -20,7 +23,14 @@ interface StampStore {
 
   setType: (type: StampType) => void;
   setImage: (path: string, previewUrl: string) => void;
+  setImageWithDimensions: (
+    path: string,
+    previewUrl: string,
+    naturalW: number,
+    naturalH: number,
+  ) => void;
   clearImage: () => void;
+  setScalePercent: (pct: number) => void;
   setText: (text: string) => void;
   setFontFamily: (fontFamily: string) => void;
   setFontSize: (fontSize: number) => void;
@@ -32,10 +42,21 @@ interface StampStore {
   setExportProgress: (current: number, total: number) => void;
 }
 
+function derivePts(naturalW: number, naturalH: number, pct: number): { widthPt: number; heightPt: number } {
+  const scale = pct / 100;
+  return {
+    widthPt: Math.max(1, naturalW * scale),
+    heightPt: Math.max(1, naturalH * scale),
+  };
+}
+
 export const useStampStore = create<StampStore>((set) => ({
   type: 'image',
   imagePath: null,
   imagePreviewUrl: null,
+  naturalWidthPx: 0,
+  naturalHeightPx: 0,
+  scalePercent: 100,
   text: 'STAMP',
   fontFamily: 'Helvetica',
   fontSize: 24,
@@ -50,11 +71,29 @@ export const useStampStore = create<StampStore>((set) => ({
 
   setType: (type) => set({ type }),
   setImage: (path, previewUrl) => set({ imagePath: path, imagePreviewUrl: previewUrl }),
+  setImageWithDimensions: (path, previewUrl, naturalW, naturalH) =>
+    set((state) => ({
+      imagePath: path,
+      imagePreviewUrl: previewUrl,
+      naturalWidthPx: naturalW,
+      naturalHeightPx: naturalH,
+      ...derivePts(naturalW, naturalH, state.scalePercent),
+    })),
   clearImage: () =>
     set((state) => {
       if (state.imagePreviewUrl) URL.revokeObjectURL(state.imagePreviewUrl);
-      return { imagePath: null, imagePreviewUrl: null };
+      return {
+        imagePath: null,
+        imagePreviewUrl: null,
+        naturalWidthPx: 0,
+        naturalHeightPx: 0,
+      };
     }),
+  setScalePercent: (pct) =>
+    set((state) => ({
+      scalePercent: pct,
+      ...derivePts(state.naturalWidthPx, state.naturalHeightPx, pct),
+    })),
   setText: (text) => set({ text }),
   setFontFamily: (fontFamily) => set({ fontFamily }),
   setFontSize: (fontSize) => set({ fontSize }),

@@ -1,11 +1,18 @@
 import { create } from 'zustand';
 
+export interface StampPos {
+  xPt: number;
+  yPt: number;
+}
+
 export interface PdfFile {
   path: string;
   filename: string;
   widthPt: number;
   heightPt: number;
   previewUrl: string | null;
+  /** null = not individually placed; inherits global stamp position at export */
+  stampPos: StampPos | null;
 }
 
 interface PdfStore {
@@ -14,6 +21,7 @@ interface PdfStore {
   addFiles: (files: PdfFile[]) => void;
   setSelectedIndex: (index: number) => void;
   setPreviewUrl: (index: number, url: string) => void;
+  setStampPos: (index: number, xPt: number, yPt: number) => void;
   removeFile: (index: number) => void;
   clearFiles: () => void;
 }
@@ -33,6 +41,13 @@ export const usePdfStore = create<PdfStore>((set) => ({
     set((state) => ({
       files: state.files.map((f, i) =>
         i === index ? { ...f, previewUrl: url } : f,
+      ),
+    })),
+
+  setStampPos: (index, xPt, yPt) =>
+    set((state) => ({
+      files: state.files.map((f, i) =>
+        i === index ? { ...f, stampPos: { xPt, yPt } } : f,
       ),
     })),
 

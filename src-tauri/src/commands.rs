@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Serialize)]
 pub struct PdfInfo {
@@ -6,6 +6,12 @@ pub struct PdfInfo {
     pub filename: String,
     pub width_pt: f32,
     pub height_pt: f32,
+}
+
+#[derive(Deserialize)]
+pub struct StampPosition {
+    pub x: f32,
+    pub y: f32,
 }
 
 #[tauri::command]
@@ -55,12 +61,19 @@ pub async fn stamp_pdfs(
     font_size: Option<f32>,
     font_name: Option<String>,
     color: Option<String>,
-    x: f32,
-    y: f32,
+    positions: Vec<StampPosition>,
     width: f32,
     height: f32,
     output_dir: String,
 ) -> Result<Vec<String>, String> {
+    if positions.len() != paths.len() {
+        return Err(format!(
+            "positions length ({}) must match paths length ({})",
+            positions.len(),
+            paths.len()
+        ));
+    }
+
     let image_data = match image_path {
         Some(ref p) => Some(std::fs::read(p).map_err(|e| e.to_string())?),
         None => None,
@@ -68,7 +81,8 @@ pub async fn stamp_pdfs(
 
     let mut output_paths = Vec::new();
 
-    for path in &paths {
+    for (idx, path) in paths.iter().enumerate() {
+        let pos = &positions[idx];
         let pdf_bytes = std::fs::read(path).map_err(|e| e.to_string())?;
 
         let stamped = match stamp_type.as_str() {
@@ -76,7 +90,7 @@ pub async fn stamp_pdfs(
                 let img = image_data
                     .as_ref()
                     .ok_or("No image data provided")?;
-                crate::pdf::stamp_image(&pdf_bytes, img, x, y, width, height)
+                crate::pdf::stamp_image(&pdf_bytes, img, pos.x, pos.y, width, height)
                     .map_err(|e| e.to_string())?
             }
             "text" => {
@@ -86,7 +100,7 @@ pub async fn stamp_pdfs(
                 let rgb = color
                     .as_deref()
                     .and_then(crate::pdf::parse_hex_color);
-                crate::pdf::stamp_text(&pdf_bytes, txt, x, y, size, font, rgb)
+                crate::pdf::stamp_text(&pdf_bytes, txt, pos.x, pos.y, size, font, rgb)
                     .map_err(|e| e.to_string())?
             }
             _ => return Err(format!("Unknown stamp type: {}", stamp_type)),
@@ -97,9 +111,10 @@ pub async fn stamp_pdfs(
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "output".into());
 
-        let output_path = format!("{}/{}-stamped.pdf", output_dir, original_name);
+        let output_path = std::path::Path::new(&output_dir)
+            .join(format!("{}.pdf", original_name));
         std::fs::write(&output_path, &stamped).map_err(|e| e.to_string())?;
-        output_paths.push(output_path);
+        output_paths.push(output_path.to_string_lossy().into_owned());
     }
 
     Ok(output_paths)

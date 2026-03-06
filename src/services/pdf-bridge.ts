@@ -37,6 +37,11 @@ export async function selectOutputDir(): Promise<string | null> {
   return typeof selected === 'string' ? selected : null;
 }
 
+export interface StampPosition {
+  x: number;
+  y: number;
+}
+
 export interface StampParams {
   paths: string[];
   stampType: 'image' | 'text';
@@ -45,8 +50,8 @@ export interface StampParams {
   fontSize: number | null;
   fontName: string | null;
   color: string | null;
-  x: number;
-  y: number;
+  /** Per-file stamp positions; must be same length as paths */
+  positions: StampPosition[];
   width: number;
   height: number;
   outputDir: string;
@@ -61,8 +66,7 @@ export async function stampAllPdfs(params: StampParams): Promise<string[]> {
     fontSize: params.fontSize,
     fontName: params.fontName,
     color: params.color,
-    x: params.x,
-    y: params.y,
+    positions: params.positions,
     width: params.width,
     height: params.height,
     outputDir: params.outputDir,

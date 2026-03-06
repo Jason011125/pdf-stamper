@@ -29,6 +29,7 @@ export function FileList(): React.JSX.Element {
         widthPt: info.width_pt,
         heightPt: info.height_pt,
         previewUrl: null,
+        stampPos: null,
       }));
 
       addFiles(pdfFiles);

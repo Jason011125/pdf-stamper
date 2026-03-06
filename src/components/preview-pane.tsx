@@ -3,17 +3,10 @@ import { usePdfStore } from '../stores/pdf-store';
 import { useStampStore } from '../stores/stamp-store';
 import { pdfSizeToScreen } from '../services/coordinate-utils';
 
-/**
- * Stamp position is stored in the store as screen-space percentages (0–1)
- * relative to the image dimensions. This avoids PDF coordinate Y-flip bugs
- * and makes drag positioning straightforward.
- *
- * Conversion to PDF points only happens at export time (in stamp-controls).
- */
-
 export function PreviewPane(): React.JSX.Element {
   const files = usePdfStore((s) => s.files);
   const selectedIndex = usePdfStore((s) => s.selectedIndex);
+  const setStampPos = usePdfStore((s) => s.setStampPos);
   const file = files[selectedIndex];
 
   const stampType = useStampStore((s) => s.type);
@@ -21,13 +14,18 @@ export function PreviewPane(): React.JSX.Element {
   const text = useStampStore((s) => s.text);
   const fontSize = useStampStore((s) => s.fontSize);
   const color = useStampStore((s) => s.color);
-  const xPt = useStampStore((s) => s.xPt);
-  const yPt = useStampStore((s) => s.yPt);
+  const globalXPt = useStampStore((s) => s.xPt);
+  const globalYPt = useStampStore((s) => s.yPt);
   const widthPt = useStampStore((s) => s.widthPt);
   const heightPt = useStampStore((s) => s.heightPt);
   const isPlaced = useStampStore((s) => s.isPlaced);
   const setPosition = useStampStore((s) => s.setPosition);
   const setPlaced = useStampStore((s) => s.setPlaced);
+
+  // Effective position: use this file's individual position if set, else global
+  const xPt = file?.stampPos?.xPt ?? globalXPt;
+  const yPt = file?.stampPos?.yPt ?? globalYPt;
+  const isStampVisible = isPlaced || (file?.stampPos != null);
 
   const containerRef = useRef<HTMLDivElement>(null);
   const imageRef = useRef<HTMLImageElement>(null);
@@ -55,8 +53,6 @@ export function PreviewPane(): React.JSX.Element {
       if (!file || imageSize.width === 0) return { x: 0, y: 0 };
       const x = (pdfX / file.widthPt) * imageSize.width;
       // PDF y is from bottom; screen y is from top.
-      // pdfY is the bottom-left corner of the stamp in PDF space.
-      // Screen top-left y = image height - ((pdfY + stampHeightPt) / pageHeightPt) * imageHeight
       const y =
         imageSize.height -
         ((pdfY + heightPt) / file.heightPt) * imageSize.height;
@@ -70,9 +66,6 @@ export function PreviewPane(): React.JSX.Element {
     (screenX: number, screenY: number): { x: number; y: number } => {
       if (!file || imageSize.width === 0) return { x: 0, y: 0 };
       const x = (screenX / imageSize.width) * file.widthPt;
-      // screenY is top of the stamp. Convert to PDF bottom-left:
-      // The bottom of the stamp in screen space = screenY + stampScreenHeight
-      // PDF y = pageHeight - (bottomScreenY / imageHeight) * pageHeight
       const stampScreenH = (heightPt / file.heightPt) * imageSize.height;
       const bottomScreenY = screenY + stampScreenH;
       const y =
@@ -82,10 +75,19 @@ export function PreviewPane(): React.JSX.Element {
     [file, imageSize, heightPt],
   );
 
+  // Write position: update both the current file's individual position AND the global
+  const applyPosition = useCallback(
+    (pdfX: number, pdfY: number) => {
+      setStampPos(selectedIndex, pdfX, pdfY); // lock this file's position
+      setPosition(pdfX, pdfY);               // advance global (unset files inherit)
+      setPlaced(true);
+    },
+    [selectedIndex, setStampPos, setPosition, setPlaced],
+  );
+
   // Click on preview to place stamp
   const handleImageClick = useCallback(
     (e: React.MouseEvent<HTMLDivElement>) => {
-      // Skip if this click was the end of a drag
       if (didDragRef.current) {
         didDragRef.current = false;
         return;
@@ -96,7 +98,6 @@ export function PreviewPane(): React.JSX.Element {
       const clickX = e.clientX - rect.left;
       const clickY = e.clientY - rect.top;
 
-      // Center the stamp on the click point
       const stampScreenSize = pdfSizeToScreen(
         widthPt,
         heightPt,
@@ -115,10 +116,9 @@ export function PreviewPane(): React.JSX.Element {
       );
 
       const pdf = toPdfPos(topLeftX, topLeftY);
-      setPosition(pdf.x, pdf.y);
-      setPlaced(true);
+      applyPosition(pdf.x, pdf.y);
     },
-    [file, imageSize, widthPt, heightPt, toPdfPos, setPosition, setPlaced],
+    [file, imageSize, widthPt, heightPt, toPdfPos, applyPosition],
   );
 
   // Drag stamp to reposition
@@ -156,7 +156,7 @@ export function PreviewPane(): React.JSX.Element {
         const clampedY = Math.max(0, Math.min(newTop, imageSize.height - stampScreenSize.height));
 
         const pdf = toPdfPos(clampedX, clampedY);
-        setPosition(pdf.x, pdf.y);
+        applyPosition(pdf.x, pdf.y);
       };
 
       const handleUp = (): void => {
@@ -167,7 +167,7 @@ export function PreviewPane(): React.JSX.Element {
       window.addEventListener('mousemove', handleMove);
       window.addEventListener('mouseup', handleUp);
     },
-    [file, imageSize, widthPt, heightPt, toPdfPos, setPosition],
+    [file, imageSize, widthPt, heightPt, toPdfPos, applyPosition],
   );
 
   if (!file) {
@@ -232,7 +232,7 @@ export function PreviewPane(): React.JSX.Element {
           }}
         />
 
-        {isPlaced && imageSize.width > 0 && (
+        {isStampVisible && imageSize.width > 0 && (
           <div
             onMouseDown={handleStampMouseDown}
             className="absolute border-2 border-dashed border-blue-500 bg-blue-500/10 cursor-move flex items-center justify-center overflow-hidden"

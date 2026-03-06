@@ -5,31 +5,47 @@ import { stampAllPdfs, selectOutputDir } from '../services/pdf-bridge';
 import { open } from '@tauri-apps/plugin-dialog';
 import { invoke } from '@tauri-apps/api/core';
 
-async function readImagePreview(path: string): Promise<string> {
+async function readImagePreview(
+  path: string,
+): Promise<{ previewUrl: string; naturalW: number; naturalH: number }> {
   const bytes = await invoke<number[]>('read_file_bytes', { path });
   const uint8 = new Uint8Array(bytes);
   const blob = new Blob([uint8], { type: 'image/png' });
-  return URL.createObjectURL(blob);
+  const previewUrl = URL.createObjectURL(blob);
+
+  const { naturalW, naturalH } = await new Promise<{ naturalW: number; naturalH: number }>(
+    (resolve) => {
+      const img = new Image();
+      img.onload = () => resolve({ naturalW: img.naturalWidth, naturalH: img.naturalHeight });
+      img.onerror = () => resolve({ naturalW: 100, naturalH: 100 });
+      img.src = previewUrl;
+    },
+  );
+
+  return { previewUrl, naturalW, naturalH };
 }
 
 export function StampControls(): React.JSX.Element {
   const files = usePdfStore((s) => s.files);
+  const selectedIndex = usePdfStore((s) => s.selectedIndex);
 
   const stampType = useStampStore((s) => s.type);
   const setType = useStampStore((s) => s.setType);
   const imagePreviewUrl = useStampStore((s) => s.imagePreviewUrl);
   const imagePath = useStampStore((s) => s.imagePath);
-  const setImage = useStampStore((s) => s.setImage);
+  const setImageWithDimensions = useStampStore((s) => s.setImageWithDimensions);
   const clearImage = useStampStore((s) => s.clearImage);
+  const scalePercent = useStampStore((s) => s.scalePercent);
+  const setScalePercent = useStampStore((s) => s.setScalePercent);
+  const widthPt = useStampStore((s) => s.widthPt);
+  const heightPt = useStampStore((s) => s.heightPt);
+  const setSize = useStampStore((s) => s.setSize);
   const text = useStampStore((s) => s.text);
   const setText = useStampStore((s) => s.setText);
   const fontSize = useStampStore((s) => s.fontSize);
   const setFontSize = useStampStore((s) => s.setFontSize);
   const color = useStampStore((s) => s.color);
   const setColor = useStampStore((s) => s.setColor);
-  const widthPt = useStampStore((s) => s.widthPt);
-  const heightPt = useStampStore((s) => s.heightPt);
-  const setSize = useStampStore((s) => s.setSize);
   const xPt = useStampStore((s) => s.xPt);
   const yPt = useStampStore((s) => s.yPt);
   const isPlaced = useStampStore((s) => s.isPlaced);
@@ -47,9 +63,9 @@ export function StampControls(): React.JSX.Element {
     if (!selected) return;
 
     const path = typeof selected === 'string' ? selected : selected;
-    const previewUrl = await readImagePreview(path);
-    setImage(path, previewUrl);
-  }, [setImage]);
+    const { previewUrl, naturalW, naturalH } = await readImagePreview(path);
+    setImageWithDimensions(path, previewUrl, naturalW, naturalH);
+  }, [setImageWithDimensions]);
 
   const handleApplyAll = useCallback(async () => {
     if (files.length === 0 || !isPlaced) return;
@@ -62,6 +78,10 @@ export function StampControls(): React.JSX.Element {
 
     try {
       const paths = files.map((f) => f.path);
+      const positions = files.map((f) => ({
+        x: f.stampPos?.xPt ?? xPt,
+        y: f.stampPos?.yPt ?? yPt,
+      }));
       const result = await stampAllPdfs({
         paths,
         stampType,
@@ -70,8 +90,7 @@ export function StampControls(): React.JSX.Element {
         fontSize: stampType === 'text' ? fontSize : null,
         fontName: stampType === 'text' ? fontName : null,
         color: stampType === 'text' ? color : null,
-        x: xPt,
-        y: yPt,
+        positions,
         width: widthPt,
         height: heightPt,
         outputDir: dir,
@@ -85,7 +104,7 @@ export function StampControls(): React.JSX.Element {
     }
   }, [
     files, isPlaced, stampType, imagePath, text, fontSize, fontName, color,
-    xPt, yPt, widthPt, heightPt, setExporting, setExportProgress,
+    xPt, yPt, widthPt, heightPt, setExporting, setExportProgress, selectedIndex,
   ]);
 
   return (
@@ -173,33 +192,44 @@ export function StampControls(): React.JSX.Element {
         </div>
       )}
 
-      {/* Stamp dimensions */}
-      <div className="space-y-1">
-        <span className="text-xs text-gray-500">Stamp Size (points)</span>
-        <div className="flex gap-2">
+      {/* Stamp size controls */}
+      {stampType === 'image' && imagePath !== null && (
+        <div className="space-y-1">
+          <span className="text-xs text-gray-500">Scale (%)</span>
           <input
             type="number"
-            value={widthPt}
-            onChange={(e) => setSize(Number(e.target.value), heightPt)}
-            min={10}
-            className="w-20 rounded-md border border-gray-300 px-2 py-1 text-sm"
-            placeholder="W"
+            value={scalePercent}
+            onChange={(e) => setScalePercent(Math.max(1, Number(e.target.value)))}
+            min={1}
+            className="w-full rounded-md border border-gray-300 px-2 py-1 text-sm"
           />
-          <input
-            type="number"
-            value={heightPt}
-            onChange={(e) => setSize(widthPt, Number(e.target.value))}
-            min={10}
-            className="w-20 rounded-md border border-gray-300 px-2 py-1 text-sm"
-            placeholder="H"
-          />
+          <span className="text-xs text-gray-400">
+            {widthPt.toFixed(0)} × {heightPt.toFixed(0)} pt
+          </span>
         </div>
-      </div>
+      )}
 
-      {/* Position info */}
-      {isPlaced && (
-        <div className="text-xs text-gray-400">
-          Position: ({xPt.toFixed(1)}, {yPt.toFixed(1)}) pt
+      {stampType === 'text' && (
+        <div className="space-y-1">
+          <span className="text-xs text-gray-500">Stamp Size (points)</span>
+          <div className="flex gap-2">
+            <input
+              type="number"
+              value={widthPt}
+              onChange={(e) => setSize(Number(e.target.value), heightPt)}
+              min={10}
+              className="w-20 rounded-md border border-gray-300 px-2 py-1 text-sm"
+              placeholder="W"
+            />
+            <input
+              type="number"
+              value={heightPt}
+              onChange={(e) => setSize(widthPt, Number(e.target.value))}
+              min={10}
+              className="w-20 rounded-md border border-gray-300 px-2 py-1 text-sm"
+              placeholder="H"
+            />
+          </div>
         </div>
       )}
 
