@@ -54,6 +54,8 @@ export interface StampParams {
   positions: StampPosition[];
   width: number;
   height: number;
+  /** Rotation in degrees, clockwise on screen (0–359) */
+  rotation: number;
   outputDir: string;
 }
 
@@ -69,6 +71,7 @@ export async function stampAllPdfs(params: StampParams): Promise<string[]> {
     positions: params.positions,
     width: params.width,
     height: params.height,
+    rotation: params.rotation,
     outputDir: params.outputDir,
   });
 }

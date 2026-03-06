@@ -18,6 +18,7 @@ export function PreviewPane(): React.JSX.Element {
   const globalYPt = useStampStore((s) => s.yPt);
   const widthPt = useStampStore((s) => s.widthPt);
   const heightPt = useStampStore((s) => s.heightPt);
+  const rotationDeg = useStampStore((s) => s.rotationDeg);
   const isPlaced = useStampStore((s) => s.isPlaced);
   const setPosition = useStampStore((s) => s.setPosition);
   const setPlaced = useStampStore((s) => s.setPlaced);
@@ -241,6 +242,8 @@ export function PreviewPane(): React.JSX.Element {
               top: screenPos.y,
               width: stampScreenSize.width,
               height: stampScreenSize.height,
+              transform: `rotate(${rotationDeg}deg)`,
+              transformOrigin: 'center center',
             }}
           >
             {stampType === 'image' && imagePreviewUrl && (

@@ -9,6 +9,7 @@ interface StampStore {
   naturalWidthPx: number;
   naturalHeightPx: number;
   scalePercent: number;
+  rotationDeg: number;
   text: string;
   fontFamily: string;
   fontSize: number;
@@ -31,6 +32,7 @@ interface StampStore {
   ) => void;
   clearImage: () => void;
   setScalePercent: (pct: number) => void;
+  setRotation: (deg: number) => void;
   setText: (text: string) => void;
   setFontFamily: (fontFamily: string) => void;
   setFontSize: (fontSize: number) => void;
@@ -57,6 +59,7 @@ export const useStampStore = create<StampStore>((set) => ({
   naturalWidthPx: 0,
   naturalHeightPx: 0,
   scalePercent: 100,
+  rotationDeg: 0,
   text: 'STAMP',
   fontFamily: 'Helvetica',
   fontSize: 24,
@@ -94,6 +97,7 @@ export const useStampStore = create<StampStore>((set) => ({
       scalePercent: pct,
       ...derivePts(state.naturalWidthPx, state.naturalHeightPx, pct),
     })),
+  setRotation: (deg) => set({ rotationDeg: Math.round(((deg % 360) + 360) % 360) }),
   setText: (text) => set({ text }),
   setFontFamily: (fontFamily) => set({ fontFamily }),
   setFontSize: (fontSize) => set({ fontSize }),

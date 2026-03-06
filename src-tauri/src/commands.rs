@@ -64,6 +64,7 @@ pub async fn stamp_pdfs(
     positions: Vec<StampPosition>,
     width: f32,
     height: f32,
+    rotation: f32,
     output_dir: String,
 ) -> Result<Vec<String>, String> {
     if positions.len() != paths.len() {
@@ -90,7 +91,7 @@ pub async fn stamp_pdfs(
                 let img = image_data
                     .as_ref()
                     .ok_or("No image data provided")?;
-                crate::pdf::stamp_image(&pdf_bytes, img, pos.x, pos.y, width, height)
+                crate::pdf::stamp_image(&pdf_bytes, img, pos.x, pos.y, width, height, rotation)
                     .map_err(|e| e.to_string())?
             }
             "text" => {
@@ -100,7 +101,7 @@ pub async fn stamp_pdfs(
                 let rgb = color
                     .as_deref()
                     .and_then(crate::pdf::parse_hex_color);
-                crate::pdf::stamp_text(&pdf_bytes, txt, pos.x, pos.y, size, font, rgb)
+                crate::pdf::stamp_text(&pdf_bytes, txt, pos.x, pos.y, size, font, rgb, rotation)
                     .map_err(|e| e.to_string())?
             }
             _ => return Err(format!("Unknown stamp type: {}", stamp_type)),

@@ -37,6 +37,8 @@ export function StampControls(): React.JSX.Element {
   const clearImage = useStampStore((s) => s.clearImage);
   const scalePercent = useStampStore((s) => s.scalePercent);
   const setScalePercent = useStampStore((s) => s.setScalePercent);
+  const rotationDeg = useStampStore((s) => s.rotationDeg);
+  const setRotation = useStampStore((s) => s.setRotation);
   const widthPt = useStampStore((s) => s.widthPt);
   const heightPt = useStampStore((s) => s.heightPt);
   const setSize = useStampStore((s) => s.setSize);
@@ -93,6 +95,7 @@ export function StampControls(): React.JSX.Element {
         positions,
         width: widthPt,
         height: heightPt,
+        rotation: rotationDeg,
         outputDir: dir,
       });
       setExportProgress(result.length, files.length);
@@ -104,7 +107,7 @@ export function StampControls(): React.JSX.Element {
     }
   }, [
     files, isPlaced, stampType, imagePath, text, fontSize, fontName, color,
-    xPt, yPt, widthPt, heightPt, setExporting, setExportProgress, selectedIndex,
+    xPt, yPt, widthPt, heightPt, rotationDeg, setExporting, setExportProgress, selectedIndex,
   ]);
 
   return (
@@ -232,6 +235,46 @@ export function StampControls(): React.JSX.Element {
           </div>
         </div>
       )}
+
+      {/* Rotation controls */}
+      <div className="space-y-2">
+        <span className="text-xs text-gray-500">Rotation</span>
+        <div className="flex gap-2">
+          <button
+            onClick={() => setRotation(rotationDeg - 90)}
+            className="flex-1 rounded-md border border-gray-300 px-2 py-1.5 text-sm text-gray-600 hover:bg-gray-50 transition-colors"
+            title="Rotate 90° counter-clockwise"
+          >
+            ↺ CCW 90°
+          </button>
+          <button
+            onClick={() => setRotation(rotationDeg + 90)}
+            className="flex-1 rounded-md border border-gray-300 px-2 py-1.5 text-sm text-gray-600 hover:bg-gray-50 transition-colors"
+            title="Rotate 90° clockwise"
+          >
+            ↻ CW 90°
+          </button>
+        </div>
+        <div className="flex items-center gap-2">
+          <input
+            type="range"
+            min={0}
+            max={359}
+            value={rotationDeg}
+            onChange={(e) => setRotation(Number(e.target.value))}
+            className="flex-1 accent-blue-500"
+          />
+          <input
+            type="number"
+            min={0}
+            max={359}
+            value={rotationDeg}
+            onChange={(e) => setRotation(Number(e.target.value))}
+            className="w-14 rounded-md border border-gray-300 px-2 py-1 text-sm text-right"
+          />
+          <span className="text-xs text-gray-400">°</span>
+        </div>
+      </div>
 
       {/* Spacer */}
       <div className="flex-1" />

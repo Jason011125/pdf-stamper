@@ -93,6 +93,26 @@ pub fn render_page_to_png(pdf_bytes: &[u8], target_width: u16) -> Result<Vec<u8>
 /// Overlay an image stamp on the first page of a PDF.
 /// Uses a self-contained Form XObject so we only need to register one name
 /// in the page's Resources, and the image lives inside the Form's own Resources.
+/// Build the 6-element PDF `cm` matrix that scales an image from unit-square
+/// [0,1]×[0,1] to (width × height) and rotates it clockwise by `deg` degrees
+/// (visually, on screen) around the center point (cx, cy).
+///
+/// PDF's y-axis points up, so a visually-clockwise rotation corresponds to
+/// a positive angle in PDF's CCW convention.
+fn image_cm(cx: f32, cy: f32, width: f32, height: f32, deg: f32) -> [f32; 6] {
+    let alpha = deg.to_radians(); // positive = CCW in PDF = CW on screen
+    let cos = alpha.cos();
+    let sin = alpha.sin();
+    // a,b,c,d encode rotate-then-scale; e,f position the center at (cx,cy)
+    let a = width * cos;
+    let b = width * sin;
+    let c = -height * sin;
+    let d = height * cos;
+    let e = cx - 0.5 * a - 0.5 * c;
+    let f = cy - 0.5 * b - 0.5 * d;
+    [a, b, c, d, e, f]
+}
+
 pub fn stamp_image(
     pdf_bytes: &[u8],
     image_bytes: &[u8],
@@ -100,6 +120,7 @@ pub fn stamp_image(
     y: f32,
     width: f32,
     height: f32,
+    rotation_deg: f32,
 ) -> Result<Vec<u8>, PdfError> {
     let mut doc = Document::load_mem(pdf_bytes)
         .map_err(|e| PdfError::StampError(e.to_string()))?;
@@ -114,14 +135,12 @@ pub fn stamp_image(
 
     // Build a Form XObject that draws the image, carrying its own Resources
     let img_ref_name = b"Img0";
+    let cx = x + width / 2.0;
+    let cy = y + height / 2.0;
+    let [a, b, c, d, e, f] = image_cm(cx, cy, width, height, rotation_deg);
     let form_ops = vec![
         Operation::new("q", vec![]),
-        Operation::new(
-            "cm",
-            vec![
-                width.into(), 0.into(), 0.into(), height.into(), x.into(), y.into(),
-            ],
-        ),
+        Operation::new("cm", vec![a.into(), b.into(), c.into(), d.into(), e.into(), f.into()]),
         Operation::new("Do", vec![Name(img_ref_name.to_vec())]),
         Operation::new("Q", vec![]),
     ];
@@ -180,6 +199,7 @@ pub fn stamp_text(
     font_size: f32,
     font_name: &str,
     color: Option<(f32, f32, f32)>,
+    rotation_deg: f32,
 ) -> Result<Vec<u8>, PdfError> {
     let mut doc = Document::load_mem(pdf_bytes)
         .map_err(|e| PdfError::StampError(e.to_string()))?;
@@ -208,7 +228,15 @@ pub fn stamp_text(
         "Tf",
         vec![Name(font_ref_name.to_vec()), font_size.into()],
     ));
-    ops.push(Operation::new("Td", vec![x.into(), y.into()]));
+    // Use Tm (text matrix) to set position and rotation simultaneously.
+    // PDF positive angle = CCW in y-up space = CW visually on screen.
+    let alpha = rotation_deg.to_radians();
+    let cos = alpha.cos();
+    let sin = alpha.sin();
+    ops.push(Operation::new(
+        "Tm",
+        vec![cos.into(), sin.into(), (-sin).into(), cos.into(), x.into(), y.into()],
+    ));
     ops.push(Operation::new("Tj", vec![Object::string_literal(text)]));
     ops.push(Operation::new("ET", vec![]));
     ops.push(Operation::new("Q", vec![]));
@@ -572,7 +600,7 @@ mod tests {
 
         // Stamp it
         println!("\n=== STAMPING (100,100) 200x200 ===");
-        let result = stamp_image(&pdf_bytes, &img_bytes, 100.0, 100.0, 200.0, 200.0);
+        let result = stamp_image(&pdf_bytes, &img_bytes, 100.0, 100.0, 200.0, 200.0, 0.0);
         match &result {
             Ok(output) => {
                 println!("OK — output {} bytes", output.len());
