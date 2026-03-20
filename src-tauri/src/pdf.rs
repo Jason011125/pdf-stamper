@@ -16,8 +16,58 @@ pub enum PdfError {
     IoError(#[from] std::io::Error),
 }
 
-/// Extract page dimensions (width, height) in points from the first page.
-pub fn get_page_dimensions(pdf_bytes: &[u8]) -> Result<(f32, f32), PdfError> {
+/// Parse a PDF object as f32, handling both Real and Integer types.
+fn obj_as_f32(obj: &Object) -> Option<f32> {
+    obj.as_float().ok().map(|v| v as f32)
+        .or_else(|| obj.as_i64().ok().map(|i| i as f32))
+}
+
+/// Extract an array value from a dictionary, resolving indirect references.
+fn resolve_array<'a>(doc: &'a Document, dict: &'a Dictionary, key: &[u8]) -> Option<Vec<&'a Object>> {
+    match dict.get(key).ok()? {
+        Object::Array(arr) => Some(arr.iter().collect()),
+        Object::Reference(id) => {
+            if let Ok(Object::Array(arr)) = doc.get_object(*id) {
+                Some(arr.iter().collect())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Extract an integer value from a dictionary, resolving indirect references.
+fn resolve_int(doc: &Document, dict: &Dictionary, key: &[u8]) -> Option<i64> {
+    match dict.get(key).ok()? {
+        Object::Integer(i) => Some(*i),
+        Object::Reference(id) => {
+            if let Ok(Object::Integer(i)) = doc.get_object(*id) {
+                Some(*i)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Page geometry info: raw MediaBox dimensions, rotation, and effective (as-displayed) dimensions.
+pub struct PageGeometry {
+    /// Raw MediaBox width (before rotation).
+    pub raw_width: f32,
+    /// Raw MediaBox height (before rotation).
+    pub raw_height: f32,
+    /// Page rotation in degrees (0, 90, 180, 270).
+    pub rotation: u32,
+    /// Effective width as displayed (after applying rotation).
+    pub eff_width: f32,
+    /// Effective height as displayed (after applying rotation).
+    pub eff_height: f32,
+}
+
+/// Extract page geometry from the first page, handling inherited MediaBox and /Rotate.
+pub fn get_page_geometry(pdf_bytes: &[u8]) -> Result<PageGeometry, PdfError> {
     let doc = Document::load_mem(pdf_bytes)
         .map_err(|e| PdfError::LoadError(e.to_string()))?;
 
@@ -30,26 +80,69 @@ pub fn get_page_dimensions(pdf_bytes: &[u8]) -> Result<(f32, f32), PdfError> {
         .get_object(page_id)
         .map_err(|e| PdfError::LoadError(e.to_string()))?;
 
-    let media_box = page
+    let page_dict = page
         .as_dict()
-        .ok()
-        .and_then(|d| d.get(b"MediaBox").ok())
-        .and_then(|o| o.as_array().ok())
-        .ok_or_else(|| PdfError::LoadError("cannot read MediaBox".into()))?;
+        .map_err(|e| PdfError::LoadError(e.to_string()))?;
 
-    if media_box.len() >= 4 {
-        let width = media_box[2]
-            .as_float()
-            .or_else(|_| media_box[2].as_i64().map(|i| i as f32))
-            .unwrap_or(612.0);
-        let height = media_box[3]
-            .as_float()
-            .or_else(|_| media_box[3].as_i64().map(|i| i as f32))
-            .unwrap_or(792.0);
-        Ok((width, height))
-    } else {
-        Ok((612.0, 792.0))
+    // Walk up the page tree to find inherited MediaBox and Rotate
+    let mut media_box_arr = resolve_array(&doc, page_dict, b"MediaBox");
+    let mut rotation = resolve_int(&doc, page_dict, b"Rotate");
+
+    // If not found on the page itself, check parent nodes
+    let mut parent_ref = page_dict.get(b"Parent").ok().and_then(|o| {
+        if let Object::Reference(id) = o { Some(*id) } else { None }
+    });
+
+    while (media_box_arr.is_none() || rotation.is_none()) && parent_ref.is_some() {
+        let pid = parent_ref.unwrap();
+        if let Ok(parent_obj) = doc.get_object(pid) {
+            if let Ok(parent_dict) = parent_obj.as_dict() {
+                if media_box_arr.is_none() {
+                    media_box_arr = resolve_array(&doc, parent_dict, b"MediaBox");
+                }
+                if rotation.is_none() {
+                    rotation = resolve_int(&doc, parent_dict, b"Rotate");
+                }
+                parent_ref = parent_dict.get(b"Parent").ok().and_then(|o| {
+                    if let Object::Reference(id) = o { Some(*id) } else { None }
+                });
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
     }
+
+    let (raw_width, raw_height) = if let Some(arr) = media_box_arr {
+        if arr.len() >= 4 {
+            let x1 = obj_as_f32(arr[0]).unwrap_or(0.0);
+            let y1 = obj_as_f32(arr[1]).unwrap_or(0.0);
+            let x2 = obj_as_f32(arr[2]).unwrap_or(612.0);
+            let y2 = obj_as_f32(arr[3]).unwrap_or(792.0);
+            ((x2 - x1).abs(), (y2 - y1).abs())
+        } else {
+            (612.0, 792.0)
+        }
+    } else {
+        (612.0, 792.0)
+    };
+
+    let rotation = (rotation.unwrap_or(0) % 360 + 360) as u32 % 360;
+
+    let (eff_width, eff_height) = if rotation == 90 || rotation == 270 {
+        (raw_height, raw_width)
+    } else {
+        (raw_width, raw_height)
+    };
+
+    Ok(PageGeometry { raw_width, raw_height, rotation, eff_width, eff_height })
+}
+
+/// Convenience wrapper returning effective (displayed) dimensions.
+pub fn get_page_dimensions(pdf_bytes: &[u8]) -> Result<(f32, f32), PdfError> {
+    let geo = get_page_geometry(pdf_bytes)?;
+    Ok((geo.eff_width, geo.eff_height))
 }
 
 /// Render the first page of a PDF to PNG bytes.
@@ -90,9 +183,44 @@ pub fn render_page_to_png(pdf_bytes: &[u8], target_width: u16) -> Result<Vec<u8>
     Ok(png_bytes)
 }
 
+/// Compute the `cm` matrix [a, b, c, d, e, f] for placing an image stamp,
+/// transforming from effective (displayed) coordinates to raw (unrotated) page space.
+///
+/// The image maps from unit square [0,0]-[1,1] to the target rectangle.
+/// For rotated pages the stamp must be counter-rotated so it appears upright
+/// in the displayed (rotated) view.
+fn image_cm_for_rotation(
+    rotation: u32,
+    dx: f32, dy: f32,
+    sw: f32, sh: f32,
+    raw_w: f32, raw_h: f32,
+) -> [f32; 6] {
+    match rotation {
+        90  => [0.0,  sw, -sh, 0.0, raw_w - dy, dx],
+        180 => [-sw, 0.0, 0.0, -sh, raw_w - dx, raw_h - dy],
+        270 => [0.0, -sw,  sh, 0.0, dy, raw_h - dx],
+        _   => [sw,  0.0, 0.0,  sh, dx, dy], // 0° — identity orientation
+    }
+}
+
+/// Compute the coordinate-space `cm` matrix that transforms display-space
+/// coordinates into raw (unrotated) page-space coordinates.
+/// Used for text stamps where position is set via `Td` in display coords.
+fn coord_cm_for_rotation(rotation: u32, raw_w: f32, raw_h: f32) -> Option<[f32; 6]> {
+    match rotation {
+        90  => Some([0.0,  1.0, -1.0, 0.0, raw_w, 0.0]),
+        180 => Some([-1.0, 0.0, 0.0, -1.0, raw_w, raw_h]),
+        270 => Some([0.0, -1.0,  1.0, 0.0, 0.0,   raw_h]),
+        _   => None, // 0° needs no extra transform
+    }
+}
+
 /// Overlay an image stamp on the first page of a PDF.
 /// Uses a self-contained Form XObject so we only need to register one name
 /// in the page's Resources, and the image lives inside the Form's own Resources.
+///
+/// Coordinates (x, y, width, height) are in the **effective** (as-displayed)
+/// coordinate system — the same space the preview uses.
 pub fn stamp_image(
     pdf_bytes: &[u8],
     image_bytes: &[u8],
@@ -109,18 +237,23 @@ pub fn stamp_image(
         .next()
         .ok_or_else(|| PdfError::StampError("PDF has no pages".into()))?;
 
+    let geo = get_page_geometry(pdf_bytes)?;
+
     // Create image XObject manually (lopdf's image_from mishandles RGBA)
     let img_id = create_image_xobject(&mut doc, image_bytes)?;
 
-    // Build a Form XObject that draws the image, carrying its own Resources
+    // Build a Form XObject that draws the image, carrying its own Resources.
+    // The cm matrix accounts for page rotation so the stamp appears at the
+    // correct position and orientation in the displayed (rotated) page.
     let img_ref_name = b"Img0";
+    let [a, b, c, d, e, f] = image_cm_for_rotation(
+        geo.rotation, x, y, width, height, geo.raw_width, geo.raw_height,
+    );
     let form_ops = vec![
         Operation::new("q", vec![]),
         Operation::new(
             "cm",
-            vec![
-                width.into(), 0.into(), 0.into(), height.into(), x.into(), y.into(),
-            ],
+            vec![a.into(), b.into(), c.into(), d.into(), e.into(), f.into()],
         ),
         Operation::new("Do", vec![Name(img_ref_name.to_vec())]),
         Operation::new("Q", vec![]),
@@ -129,8 +262,7 @@ pub fn stamp_image(
         .encode()
         .map_err(|e| PdfError::StampError(e.to_string()))?;
 
-    let (page_w, page_h) = get_page_dimensions(pdf_bytes)?;
-
+    // Form BBox uses raw (unrotated) page dimensions — form lives in page space
     let mut xobjects = Dictionary::new();
     xobjects.set(img_ref_name.as_slice(), Object::Reference(img_id));
     let mut resources = Dictionary::new();
@@ -141,7 +273,10 @@ pub fn stamp_image(
     form_dict.set("Subtype", Name(b"Form".to_vec()));
     form_dict.set(
         "BBox",
-        Object::Array(vec![0.0f32.into(), 0.0f32.into(), page_w.into(), page_h.into()]),
+        Object::Array(vec![
+            0.0f32.into(), 0.0f32.into(),
+            geo.raw_width.into(), geo.raw_height.into(),
+        ]),
     );
     form_dict.set("Resources", Object::Dictionary(resources));
 
@@ -172,6 +307,8 @@ pub fn stamp_image(
 
 /// Overlay a text stamp on the first page of a PDF.
 /// Uses a self-contained Form XObject with its own font Resources.
+///
+/// Coordinates (x, y) are in the **effective** (as-displayed) coordinate system.
 pub fn stamp_text(
     pdf_bytes: &[u8],
     text: &str,
@@ -189,6 +326,8 @@ pub fn stamp_text(
         .next()
         .ok_or_else(|| PdfError::StampError("PDF has no pages".into()))?;
 
+    let geo = get_page_geometry(pdf_bytes)?;
+
     // Create font object
     let mut font_dict = Dictionary::new();
     font_dict.set("Type", Name(b"Font".to_vec()));
@@ -200,6 +339,18 @@ pub fn stamp_text(
     let font_ref_name = b"F1";
     let mut ops = Vec::new();
     ops.push(Operation::new("q", vec![]));
+
+    // For rotated pages, apply a coordinate transform so that text position
+    // and orientation in display space map correctly to raw page space.
+    if let Some([a, b, c, d, e, f]) = coord_cm_for_rotation(
+        geo.rotation, geo.raw_width, geo.raw_height,
+    ) {
+        ops.push(Operation::new(
+            "cm",
+            vec![a.into(), b.into(), c.into(), d.into(), e.into(), f.into()],
+        ));
+    }
+
     if let Some((r, g, b)) = color {
         ops.push(Operation::new("rg", vec![r.into(), g.into(), b.into()]));
     }
@@ -217,8 +368,7 @@ pub fn stamp_text(
         .encode()
         .map_err(|e| PdfError::StampError(e.to_string()))?;
 
-    let (page_w, page_h) = get_page_dimensions(pdf_bytes)?;
-
+    // Form BBox uses raw (unrotated) page dimensions
     let mut fonts = Dictionary::new();
     fonts.set(font_ref_name.as_slice(), Object::Reference(font_id));
     let mut resources = Dictionary::new();
@@ -229,7 +379,10 @@ pub fn stamp_text(
     form_dict.set("Subtype", Name(b"Form".to_vec()));
     form_dict.set(
         "BBox",
-        Object::Array(vec![0.0f32.into(), 0.0f32.into(), page_w.into(), page_h.into()]),
+        Object::Array(vec![
+            0.0f32.into(), 0.0f32.into(),
+            geo.raw_width.into(), geo.raw_height.into(),
+        ]),
     );
     form_dict.set("Resources", Object::Dictionary(resources));
 
@@ -487,231 +640,335 @@ fn pdfium_lib_path() -> String {
 mod tests {
     use super::*;
 
-    fn describe_obj(obj: &Object) -> String {
-        match obj {
-            Object::Reference(id) => format!("Reference({} {})", id.0, id.1),
-            Object::Dictionary(d) => format!("Dictionary(len={})", d.len()),
-            Object::Array(a) => format!("Array(len={})", a.len()),
-            Object::Stream(_) => "Stream(...)".into(),
-            other => format!("{:?}", other),
+    // -- Helpers -----------------------------------------------------------
+
+    /// Create a minimal valid single-page PDF with the given MediaBox and optional /Rotate.
+    fn make_test_pdf(width: f32, height: f32, rotate: Option<u32>) -> Vec<u8> {
+        let mut doc = Document::new();
+
+        // A minimal content stream (empty page)
+        let content = Stream::new(Dictionary::new(), b"".to_vec());
+        let content_id = doc.add_object(content);
+
+        // Build the page dictionary
+        let mut page_dict = Dictionary::new();
+        page_dict.set("Type", Name(b"Page".to_vec()));
+        page_dict.set(
+            "MediaBox",
+            Object::Array(vec![
+                0.0f32.into(), 0.0f32.into(), width.into(), height.into(),
+            ]),
+        );
+        page_dict.set("Contents", Object::Reference(content_id));
+        if let Some(r) = rotate {
+            page_dict.set("Rotate", Object::Integer(r as i64));
         }
+
+        let page_id = doc.add_object(Object::Dictionary(page_dict));
+
+        // Build the Pages node
+        let mut pages_dict = Dictionary::new();
+        pages_dict.set("Type", Name(b"Pages".to_vec()));
+        pages_dict.set("Count", Object::Integer(1));
+        pages_dict.set("Kids", Object::Array(vec![Object::Reference(page_id)]));
+        let pages_id = doc.add_object(Object::Dictionary(pages_dict));
+
+        // Set parent reference on the page
+        let page = doc.get_object_mut(page_id).unwrap();
+        page.as_dict_mut().unwrap().set("Parent", Object::Reference(pages_id));
+
+        // Build the catalog
+        let mut catalog = Dictionary::new();
+        catalog.set("Type", Name(b"Catalog".to_vec()));
+        catalog.set("Pages", Object::Reference(pages_id));
+        let catalog_id = doc.add_object(Object::Dictionary(catalog));
+
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+        bytes
     }
 
-    fn print_dict(dict: &Dictionary, indent: &str) {
-        for (key, val) in dict.iter() {
-            println!("{}{} = {}",
-                indent,
-                std::str::from_utf8(key).unwrap_or("?"),
-                describe_obj(val),
-            );
+    /// Create a tiny 2x2 red PNG for stamp tests.
+    fn make_red_png() -> Vec<u8> {
+        let img = image::RgbImage::from_fn(2, 2, |_, _| image::Rgb([255, 0, 0]));
+        let mut bytes = Vec::new();
+        img.write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+        bytes
+    }
+
+    /// Extract the cm matrix values from the Form XObject's content stream in a stamped PDF.
+    fn extract_cm_from_stamped(pdf_bytes: &[u8]) -> Vec<f32> {
+        let doc = Document::load_mem(pdf_bytes).unwrap();
+        let page_id = doc.page_iter().next().unwrap();
+        let page = doc.get_object(page_id).unwrap();
+        let page_dict = page.as_dict().unwrap();
+
+        // Find the stamp Form XObject in Resources
+        let res = match page_dict.get(b"Resources").unwrap() {
+            Object::Reference(id) => doc.get_object(*id).unwrap().as_dict().unwrap().clone(),
+            Object::Dictionary(d) => d.clone(),
+            _ => panic!("unexpected Resources type"),
+        };
+        let xobjects = match res.get(b"XObject").unwrap() {
+            Object::Reference(id) => doc.get_object(*id).unwrap().as_dict().unwrap().clone(),
+            Object::Dictionary(d) => d.clone(),
+            _ => panic!("unexpected XObject type"),
+        };
+
+        // Find the Stamp* entry
+        for (name, val) in xobjects.iter() {
+            let name_str = std::str::from_utf8(name).unwrap_or("");
+            if name_str.starts_with("Stamp") {
+                if let Object::Reference(id) = val {
+                    if let Ok(Object::Stream(s)) = doc.get_object(*id) {
+                        let mut sc = s.clone();
+                        let _ = sc.decompress();
+                        let txt = String::from_utf8_lossy(&sc.content);
+                        // Parse "... a b c d e f cm ..."
+                        let parts: Vec<&str> = txt.split_whitespace().collect();
+                        for (i, &part) in parts.iter().enumerate() {
+                            if part == "cm" && i >= 6 {
+                                return (i-6..i)
+                                    .map(|j| parts[j].parse::<f32>().unwrap())
+                                    .collect();
+                            }
+                        }
+                    }
+                }
+            }
         }
+        panic!("no cm operator found in stamp Form XObject");
+    }
+
+    // -- Tests: get_page_geometry ------------------------------------------
+
+    #[test]
+    fn geometry_no_rotation() {
+        let pdf = make_test_pdf(612.0, 792.0, None);
+        let geo = get_page_geometry(&pdf).unwrap();
+        assert_eq!(geo.rotation, 0);
+        assert!((geo.raw_width - 612.0).abs() < 0.1);
+        assert!((geo.raw_height - 792.0).abs() < 0.1);
+        assert!((geo.eff_width - 612.0).abs() < 0.1);
+        assert!((geo.eff_height - 792.0).abs() < 0.1);
     }
 
     #[test]
-    fn diagnose_stamp_image() {
-        let pdf_bytes = std::fs::read(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../testing_files/test.pdf"
-        ))
-        .expect("failed to read test.pdf");
-        let img_bytes = std::fs::read(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../testing_files/stamp.png"
-        ))
-        .expect("failed to read stamp.png");
+    fn geometry_rotate_90() {
+        let pdf = make_test_pdf(612.0, 792.0, Some(90));
+        let geo = get_page_geometry(&pdf).unwrap();
+        assert_eq!(geo.rotation, 90);
+        // Raw dimensions unchanged
+        assert!((geo.raw_width - 612.0).abs() < 0.1);
+        assert!((geo.raw_height - 792.0).abs() < 0.1);
+        // Effective dimensions swapped
+        assert!((geo.eff_width - 792.0).abs() < 0.1);
+        assert!((geo.eff_height - 612.0).abs() < 0.1);
+    }
 
-        println!("=== INPUT PDF ===");
-        println!("PDF size: {} bytes", pdf_bytes.len());
-        println!("Image size: {} bytes", img_bytes.len());
+    #[test]
+    fn geometry_rotate_180() {
+        let pdf = make_test_pdf(612.0, 792.0, Some(180));
+        let geo = get_page_geometry(&pdf).unwrap();
+        assert_eq!(geo.rotation, 180);
+        // Effective dimensions same as raw for 180
+        assert!((geo.eff_width - 612.0).abs() < 0.1);
+        assert!((geo.eff_height - 792.0).abs() < 0.1);
+    }
 
-        let doc = Document::load_mem(&pdf_bytes).expect("load PDF");
-        let page_id = doc.page_iter().next().expect("no pages");
-        println!("Page ID: {:?}", page_id);
+    #[test]
+    fn geometry_rotate_270() {
+        let pdf = make_test_pdf(612.0, 792.0, Some(270));
+        let geo = get_page_geometry(&pdf).unwrap();
+        assert_eq!(geo.rotation, 270);
+        assert!((geo.eff_width - 792.0).abs() < 0.1);
+        assert!((geo.eff_height - 612.0).abs() < 0.1);
+    }
 
-        let page = doc.get_object(page_id).expect("get page");
-        let page_dict = page.as_dict().expect("page as dict");
-        println!("\n=== PAGE DICT ===");
-        print_dict(page_dict, "  ");
+    #[test]
+    fn get_page_dimensions_returns_effective() {
+        let pdf = make_test_pdf(612.0, 792.0, Some(90));
+        let (w, h) = get_page_dimensions(&pdf).unwrap();
+        // Should return effective (swapped) dimensions
+        assert!((w - 792.0).abs() < 0.1);
+        assert!((h - 612.0).abs() < 0.1);
+    }
 
-        // Check Resources
-        println!("\n=== RESOURCES ===");
-        match page_dict.get(b"Resources") {
-            Ok(Object::Reference(id)) => {
-                println!("Resources is INDIRECT ref: {:?}", id);
-                if let Ok(res_obj) = doc.get_object(*id) {
-                    if let Ok(res_dict) = res_obj.as_dict() {
-                        print_dict(res_dict, "  ");
-                        // Check XObject sub-dict
-                        if let Ok(xo) = res_dict.get(b"XObject") {
-                            println!("  XObject detail: {}", describe_obj(xo));
-                        }
+    // -- Tests: image_cm_for_rotation --------------------------------------
+
+    #[test]
+    fn cm_rotation_0() {
+        let [a, b, c, d, e, f] = image_cm_for_rotation(0, 100.0, 200.0, 50.0, 60.0, 612.0, 792.0);
+        assert_eq!([a, b, c, d, e, f], [50.0, 0.0, 0.0, 60.0, 100.0, 200.0]);
+    }
+
+    #[test]
+    fn cm_rotation_90() {
+        // dx=100, dy=200, sw=50, sh=60, W=612, H=792
+        let [a, b, c, d, e, f] = image_cm_for_rotation(90, 100.0, 200.0, 50.0, 60.0, 612.0, 792.0);
+        // Expected: [0, sw, -sh, 0, W-dy, dx] = [0, 50, -60, 0, 412, 100]
+        assert_eq!([a, b, c, d, e, f], [0.0, 50.0, -60.0, 0.0, 412.0, 100.0]);
+    }
+
+    #[test]
+    fn cm_rotation_180() {
+        let [a, b, c, d, e, f] = image_cm_for_rotation(180, 100.0, 200.0, 50.0, 60.0, 612.0, 792.0);
+        // Expected: [-sw, 0, 0, -sh, W-dx, H-dy] = [-50, 0, 0, -60, 512, 592]
+        assert_eq!([a, b, c, d, e, f], [-50.0, 0.0, 0.0, -60.0, 512.0, 592.0]);
+    }
+
+    #[test]
+    fn cm_rotation_270() {
+        let [a, b, c, d, e, f] = image_cm_for_rotation(270, 100.0, 200.0, 50.0, 60.0, 612.0, 792.0);
+        // Expected: [0, -sw, sh, 0, dy, H-dx] = [0, -50, 60, 0, 200, 692]
+        assert_eq!([a, b, c, d, e, f], [0.0, -50.0, 60.0, 0.0, 200.0, 692.0]);
+    }
+
+    // -- Tests: coord_cm_for_rotation --------------------------------------
+
+    #[test]
+    fn coord_cm_rotation_0_is_none() {
+        assert!(coord_cm_for_rotation(0, 612.0, 792.0).is_none());
+    }
+
+    #[test]
+    fn coord_cm_rotation_90() {
+        let m = coord_cm_for_rotation(90, 612.0, 792.0).unwrap();
+        assert_eq!(m, [0.0, 1.0, -1.0, 0.0, 612.0, 0.0]);
+    }
+
+    // -- Tests: stamp_image with rotation -----------------------------------
+
+    #[test]
+    fn stamp_image_no_rotation_cm() {
+        let pdf = make_test_pdf(612.0, 792.0, None);
+        let img = make_red_png();
+        let stamped = stamp_image(&pdf, &img, 100.0, 200.0, 50.0, 60.0).unwrap();
+        let cm = extract_cm_from_stamped(&stamped);
+        assert_eq!(cm, vec![50.0, 0.0, 0.0, 60.0, 100.0, 200.0]);
+    }
+
+    #[test]
+    fn stamp_image_rotation_90_cm() {
+        let pdf = make_test_pdf(612.0, 792.0, Some(90));
+        let img = make_red_png();
+        // Position in effective (display) coords — effective page is 792 x 612
+        let stamped = stamp_image(&pdf, &img, 100.0, 200.0, 50.0, 60.0).unwrap();
+        let cm = extract_cm_from_stamped(&stamped);
+        // Expected: [0, 50, -60, 0, 612-200, 100] = [0, 50, -60, 0, 412, 100]
+        assert_eq!(cm, vec![0.0, 50.0, -60.0, 0.0, 412.0, 100.0]);
+    }
+
+    #[test]
+    fn stamp_image_rotation_180_cm() {
+        let pdf = make_test_pdf(612.0, 792.0, Some(180));
+        let img = make_red_png();
+        let stamped = stamp_image(&pdf, &img, 100.0, 200.0, 50.0, 60.0).unwrap();
+        let cm = extract_cm_from_stamped(&stamped);
+        assert_eq!(cm, vec![-50.0, 0.0, 0.0, -60.0, 512.0, 592.0]);
+    }
+
+    #[test]
+    fn stamp_image_rotation_270_cm() {
+        let pdf = make_test_pdf(612.0, 792.0, Some(270));
+        let img = make_red_png();
+        let stamped = stamp_image(&pdf, &img, 100.0, 200.0, 50.0, 60.0).unwrap();
+        let cm = extract_cm_from_stamped(&stamped);
+        assert_eq!(cm, vec![0.0, -50.0, 60.0, 0.0, 200.0, 692.0]);
+    }
+
+    // -- Tests: stamp_text --------------------------------------------------
+
+    #[test]
+    fn stamp_text_no_rotation() {
+        let pdf = make_test_pdf(612.0, 792.0, None);
+        let result = stamp_text(&pdf, "TEST", 100.0, 200.0, 24.0, "Helvetica", None);
+        assert!(result.is_ok());
+        // Verify the output is a valid PDF
+        let output = result.unwrap();
+        let geo = get_page_geometry(&output).unwrap();
+        assert_eq!(geo.rotation, 0);
+    }
+
+    #[test]
+    fn stamp_text_rotation_90() {
+        let pdf = make_test_pdf(612.0, 792.0, Some(90));
+        let result = stamp_text(&pdf, "TEST", 100.0, 200.0, 24.0, "Helvetica", None);
+        assert!(result.is_ok());
+    }
+
+    // -- Tests: parse_hex_color -------------------------------------------
+
+    #[test]
+    fn parse_hex_color_valid() {
+        let (r, g, b) = parse_hex_color("#ff0000").unwrap();
+        assert!((r - 1.0).abs() < 0.01);
+        assert!(g.abs() < 0.01);
+        assert!(b.abs() < 0.01);
+    }
+
+    #[test]
+    fn parse_hex_color_no_hash() {
+        let (r, g, b) = parse_hex_color("00ff00").unwrap();
+        assert!(r.abs() < 0.01);
+        assert!((g - 1.0).abs() < 0.01);
+        assert!(b.abs() < 0.01);
+    }
+
+    #[test]
+    fn parse_hex_color_invalid() {
+        assert!(parse_hex_color("xyz").is_none());
+        assert!(parse_hex_color("#ff00").is_none());
+    }
+
+    // -- Tests: form BBox uses raw dimensions ------------------------------
+
+    #[test]
+    fn form_bbox_uses_raw_dimensions() {
+        let pdf = make_test_pdf(612.0, 792.0, Some(90));
+        let img = make_red_png();
+        let stamped = stamp_image(&pdf, &img, 100.0, 200.0, 50.0, 60.0).unwrap();
+
+        let doc = Document::load_mem(&stamped).unwrap();
+        let page_id = doc.page_iter().next().unwrap();
+        let page = doc.get_object(page_id).unwrap();
+        let page_dict = page.as_dict().unwrap();
+
+        // Find the Stamp Form XObject
+        let res = match page_dict.get(b"Resources").unwrap() {
+            Object::Reference(id) => doc.get_object(*id).unwrap().as_dict().unwrap().clone(),
+            Object::Dictionary(d) => d.clone(),
+            _ => panic!("unexpected"),
+        };
+        let xobjects = match res.get(b"XObject").unwrap() {
+            Object::Reference(id) => doc.get_object(*id).unwrap().as_dict().unwrap().clone(),
+            Object::Dictionary(d) => d.clone(),
+            _ => panic!("unexpected"),
+        };
+
+        for (name, val) in xobjects.iter() {
+            let name_str = std::str::from_utf8(name).unwrap_or("");
+            if name_str.starts_with("Stamp") {
+                if let Object::Reference(id) = val {
+                    if let Ok(Object::Stream(s)) = doc.get_object(*id) {
+                        let bbox = s.dict.get(b"BBox").unwrap().as_array().unwrap();
+                        // BBox should be [0, 0, raw_width, raw_height] = [0, 0, 612, 792]
+                        // NOT [0, 0, 792, 612] (the effective/swapped dimensions)
+                        let w = obj_as_f32(&bbox[2]).unwrap();
+                        let h = obj_as_f32(&bbox[3]).unwrap();
+                        assert!((w - 612.0).abs() < 0.1, "BBox width should be raw 612, got {}", w);
+                        assert!((h - 792.0).abs() < 0.1, "BBox height should be raw 792, got {}", h);
+                        return;
                     }
                 }
             }
-            Ok(Object::Dictionary(d)) => {
-                println!("Resources is INLINE:");
-                print_dict(d, "  ");
-            }
-            Ok(other) => println!("Resources unexpected: {}", describe_obj(other)),
-            Err(_) => println!("Resources NOT FOUND (inherited from parent)"),
         }
-
-        // Check Contents
-        println!("\n=== CONTENTS ===");
-        match page_dict.get(b"Contents") {
-            Ok(Object::Reference(id)) => println!("Single ref: {:?}", id),
-            Ok(Object::Array(arr)) => {
-                println!("Array with {} entries:", arr.len());
-                for (i, item) in arr.iter().enumerate() {
-                    println!("  [{}] {}", i, describe_obj(item));
-                }
-            }
-            Ok(other) => println!("{}", describe_obj(other)),
-            Err(_) => println!("NOT FOUND"),
-        }
-
-        // Stamp it
-        println!("\n=== STAMPING (100,100) 200x200 ===");
-        let result = stamp_image(&pdf_bytes, &img_bytes, 100.0, 100.0, 200.0, 200.0);
-        match &result {
-            Ok(output) => {
-                println!("OK — output {} bytes", output.len());
-
-                let out_doc = Document::load_mem(output).expect("reload");
-                let out_page_id = out_doc.page_iter().next().unwrap();
-                let out_page = out_doc.get_object(out_page_id).unwrap();
-                let out_dict = out_page.as_dict().unwrap();
-
-                println!("\n=== OUTPUT PAGE ===");
-                print_dict(out_dict, "  ");
-
-                // Resources/XObject in output
-                println!("\n=== OUTPUT RESOURCES ===");
-                match out_dict.get(b"Resources") {
-                    Ok(Object::Reference(res_id)) => {
-                        println!("Indirect ref: {:?}", res_id);
-                        if let Ok(r) = out_doc.get_object(*res_id) {
-                            if let Ok(rd) = r.as_dict() {
-                                print_dict(rd, "  ");
-                                if let Ok(Object::Reference(xo_id)) = rd.get(b"XObject") {
-                                    println!("  -> XObject deref {:?}:", xo_id);
-                                    if let Ok(xo) = out_doc.get_object(*xo_id) {
-                                        if let Ok(xd) = xo.as_dict() {
-                                            print_dict(xd, "      ");
-                                        }
-                                    }
-                                } else if let Ok(Object::Dictionary(xd)) = rd.get(b"XObject") {
-                                    println!("  -> XObject inline:");
-                                    print_dict(xd, "      ");
-                                }
-                            }
-                        }
-                    }
-                    Ok(Object::Dictionary(d)) => {
-                        println!("Inline:");
-                        print_dict(d, "  ");
-                    }
-                    Ok(_) => println!("unexpected type"),
-                    Err(_) => println!("NOT FOUND on output page!"),
-                }
-
-                // Contents in output
-                println!("\n=== OUTPUT CONTENTS ===");
-                match out_dict.get(b"Contents") {
-                    Ok(Object::Array(arr)) => {
-                        println!("Array with {} entries", arr.len());
-                        for (i, item) in arr.iter().enumerate() {
-                            if let Object::Reference(id) = item {
-                                if let Ok(Object::Stream(s)) = out_doc.get_object(*id) {
-                                    let mut sc = s.clone();
-                                    let _ = sc.decompress();
-                                    let txt = String::from_utf8_lossy(&sc.content);
-                                    println!("  [{}] ref {:?}: {}", i, id,
-                                        if txt.len() > 200 {
-                                            format!("{}... ({} bytes)", &txt[..200], txt.len())
-                                        } else {
-                                            txt.to_string()
-                                        }
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    Ok(Object::Reference(id)) => println!("Still single ref: {:?}", id),
-                    _ => println!("unexpected"),
-                }
-
-                // Inspect the Form XObject itself
-                println!("\n=== FORM XOBJECT (Stamp2036) ===");
-                // Find it
-                if let Ok(Object::Reference(res_id)) = out_dict.get(b"Resources") {
-                    if let Ok(res) = out_doc.get_object(*res_id) {
-                        if let Ok(rd) = res.as_dict() {
-                            if let Ok(xobj_entry) = rd.get(b"XObject") {
-                                if let Ok(xd) = xobj_entry.as_dict() {
-                                    for (name, val) in xd.iter() {
-                                        if let Object::Reference(id) = val {
-                                            if let Ok(Object::Stream(s)) = out_doc.get_object(*id) {
-                                                println!("  {} -> ref {:?}", std::str::from_utf8(name).unwrap_or("?"), id);
-                                                println!("    Dict:");
-                                                print_dict(&s.dict, "      ");
-                                                let mut sc = s.clone();
-                                                let _ = sc.decompress();
-                                                let txt = String::from_utf8_lossy(&sc.content);
-                                                if txt.len() < 500 {
-                                                    println!("    Content: {:?}", txt);
-                                                } else {
-                                                    println!("    Content: {} bytes (not a form)", sc.content.len());
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Inspect the stamp IMAGE object (inside Form's Resources)
-                println!("\n=== STAMP IMAGE OBJECT ===");
-                if let Ok(Object::Stream(form_stream)) = out_doc.get_object((2036, 0)) {
-                    if let Ok(form_res) = form_stream.dict.get(b"Resources") {
-                        if let Ok(form_res_dict) = form_res.as_dict() {
-                            println!("  Form Resources:");
-                            print_dict(form_res_dict, "    ");
-                            if let Ok(xobj) = form_res_dict.get(b"XObject") {
-                                if let Ok(xobj_dict) = xobj.as_dict() {
-                                    for (name, val) in xobj_dict.iter() {
-                                        println!("    {} = {}", std::str::from_utf8(name).unwrap_or("?"), describe_obj(val));
-                                        if let Object::Reference(img_ref) = val {
-                                            if let Ok(Object::Stream(img_s)) = out_doc.get_object(*img_ref) {
-                                                println!("    -> Image dict:");
-                                                print_dict(&img_s.dict, "        ");
-                                                println!("    -> Image data: {} bytes", img_s.content.len());
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Render input and output to compare visually
-                println!("\n=== RENDER COMPARISON ===");
-                let input_png = render_page_to_png(&pdf_bytes, 800).expect("render input");
-                let output_png = render_page_to_png(output, 800).expect("render output");
-                println!("Input PNG: {} bytes", input_png.len());
-                println!("Output PNG: {} bytes", output_png.len());
-                println!("PNGs differ: {}", input_png != output_png);
-
-                let base = concat!(env!("CARGO_MANIFEST_DIR"), "/../testing_files/");
-                std::fs::write(format!("{base}test-stamped-debug.pdf"), output).expect("write pdf");
-                std::fs::write(format!("{base}render-input.png"), &input_png).expect("write input png");
-                std::fs::write(format!("{base}render-output.png"), &output_png).expect("write output png");
-                println!("Wrote debug files to testing_files/");
-            }
-            Err(e) => println!("FAILED: {}", e),
-        }
+        panic!("Stamp Form XObject not found");
     }
 }
