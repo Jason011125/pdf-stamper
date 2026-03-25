@@ -195,11 +195,16 @@ fn image_cm_for_rotation(
     sw: f32, sh: f32,
     raw_w: f32, raw_h: f32,
 ) -> [f32; 6] {
+    // PDF images have their first sample at (0,1) in unit-square space (top-left pixel
+    // maps to the upper-left of the drawn rectangle). To place an image without vertical
+    // flip, the height component must be negated and the y-origin shifted by sh.
+    // Each rotation case is derived from the display→raw coordinate transform composed
+    // with the image-coordinate→display transform.
     match rotation {
-        90  => [0.0,  sw, -sh, 0.0, raw_w - dy, dx],
-        180 => [-sw, 0.0, 0.0, -sh, raw_w - dx, raw_h - dy],
-        270 => [0.0, -sw,  sh, 0.0, dy, raw_h - dx],
-        _   => [sw,  0.0, 0.0,  sh, dx, dy], // 0° — identity orientation
+        90  => [0.0, -sw, -sh, 0.0, dy + sh, raw_h - dx],
+        180 => [-sw, 0.0, 0.0,  sh, raw_w - dx, raw_h - dy - sh],
+        270 => [0.0,  sw,  sh, 0.0, raw_w - dy - sh, dx],
+        _   => [sw,  0.0, 0.0, -sh, dx, dy + sh], // 0° — correct orientation
     }
 }
 
@@ -207,10 +212,13 @@ fn image_cm_for_rotation(
 /// coordinates into raw (unrotated) page-space coordinates.
 /// Used for text stamps where position is set via `Td` in display coords.
 fn coord_cm_for_rotation(rotation: u32, raw_w: f32, raw_h: f32) -> Option<[f32; 6]> {
+    // For 90° CW:  display (u,v) → raw (v, raw_h − u)  → matrix [0,−1, 1,0, 0,raw_h]
+    // For 180°:    display (u,v) → raw (raw_w−u, raw_h−v) → matrix [−1,0,0,−1,raw_w,raw_h]
+    // For 270° CW: display (u,v) → raw (raw_w−v, u)   → matrix [0, 1,−1,0,raw_w,0]
     match rotation {
-        90  => Some([0.0,  1.0, -1.0, 0.0, raw_w, 0.0]),
+        90  => Some([0.0, -1.0,  1.0, 0.0, 0.0,   raw_h]),
         180 => Some([-1.0, 0.0, 0.0, -1.0, raw_w, raw_h]),
-        270 => Some([0.0, -1.0,  1.0, 0.0, 0.0,   raw_h]),
+        270 => Some([0.0,  1.0, -1.0, 0.0, raw_w, 0.0]),
         _   => None, // 0° needs no extra transform
     }
 }
@@ -804,30 +812,40 @@ mod tests {
 
     #[test]
     fn cm_rotation_0() {
+        // dx=100, dy=200, sw=50, sh=60
+        // Correct: [sw, 0, 0, -sh, dx, dy+sh] = [50, 0, 0, -60, 100, 260]
         let [a, b, c, d, e, f] = image_cm_for_rotation(0, 100.0, 200.0, 50.0, 60.0, 612.0, 792.0);
-        assert_eq!([a, b, c, d, e, f], [50.0, 0.0, 0.0, 60.0, 100.0, 200.0]);
+        assert_eq!([a, b, c, d, e, f], [50.0, 0.0, 0.0, -60.0, 100.0, 260.0]);
     }
 
     #[test]
     fn cm_rotation_90() {
         // dx=100, dy=200, sw=50, sh=60, W=612, H=792
+        // display→raw (90° CW): (u,v)→(v, H-u)
+        // (0,0)→TL=(dy+sh, H-dx)=(260,692), (1,0)→TR=(260,642), (0,1)→BL=(200,692)
+        // Correct: [0, -sw, -sh, 0, dy+sh, H-dx] = [0, -50, -60, 0, 260, 692]
         let [a, b, c, d, e, f] = image_cm_for_rotation(90, 100.0, 200.0, 50.0, 60.0, 612.0, 792.0);
-        // Expected: [0, sw, -sh, 0, W-dy, dx] = [0, 50, -60, 0, 412, 100]
-        assert_eq!([a, b, c, d, e, f], [0.0, 50.0, -60.0, 0.0, 412.0, 100.0]);
+        assert_eq!([a, b, c, d, e, f], [0.0, -50.0, -60.0, 0.0, 260.0, 692.0]);
     }
 
     #[test]
     fn cm_rotation_180() {
+        // dx=100, dy=200, sw=50, sh=60, W=612, H=792
+        // display→raw (180°): (u,v)→(W-u, H-v)
+        // (0,0)→TL=(W-dx, H-dy-sh)=(512,532)
+        // Correct: [-sw, 0, 0, sh, W-dx, H-dy-sh] = [-50, 0, 0, 60, 512, 532]
         let [a, b, c, d, e, f] = image_cm_for_rotation(180, 100.0, 200.0, 50.0, 60.0, 612.0, 792.0);
-        // Expected: [-sw, 0, 0, -sh, W-dx, H-dy] = [-50, 0, 0, -60, 512, 592]
-        assert_eq!([a, b, c, d, e, f], [-50.0, 0.0, 0.0, -60.0, 512.0, 592.0]);
+        assert_eq!([a, b, c, d, e, f], [-50.0, 0.0, 0.0, 60.0, 512.0, 532.0]);
     }
 
     #[test]
     fn cm_rotation_270() {
+        // dx=100, dy=200, sw=50, sh=60, W=612, H=792
+        // display→raw (270° CW): (u,v)→(W-v, u)
+        // (0,0)→TL=(W-dy-sh, dx)=(352,100)
+        // Correct: [0, sw, sh, 0, W-dy-sh, dx] = [0, 50, 60, 0, 352, 100]
         let [a, b, c, d, e, f] = image_cm_for_rotation(270, 100.0, 200.0, 50.0, 60.0, 612.0, 792.0);
-        // Expected: [0, -sw, sh, 0, dy, H-dx] = [0, -50, 60, 0, 200, 692]
-        assert_eq!([a, b, c, d, e, f], [0.0, -50.0, 60.0, 0.0, 200.0, 692.0]);
+        assert_eq!([a, b, c, d, e, f], [0.0, 50.0, 60.0, 0.0, 352.0, 100.0]);
     }
 
     // -- Tests: coord_cm_for_rotation --------------------------------------
@@ -839,8 +857,9 @@ mod tests {
 
     #[test]
     fn coord_cm_rotation_90() {
+        // display→raw (90° CW): (u,v)→(v, raw_h-u) → matrix [0,-1,1,0,0,raw_h]
         let m = coord_cm_for_rotation(90, 612.0, 792.0).unwrap();
-        assert_eq!(m, [0.0, 1.0, -1.0, 0.0, 612.0, 0.0]);
+        assert_eq!(m, [0.0, -1.0, 1.0, 0.0, 0.0, 792.0]);
     }
 
     // -- Tests: stamp_image with rotation -----------------------------------
@@ -851,7 +870,7 @@ mod tests {
         let img = make_red_png();
         let stamped = stamp_image(&pdf, &img, 100.0, 200.0, 50.0, 60.0).unwrap();
         let cm = extract_cm_from_stamped(&stamped);
-        assert_eq!(cm, vec![50.0, 0.0, 0.0, 60.0, 100.0, 200.0]);
+        assert_eq!(cm, vec![50.0, 0.0, 0.0, -60.0, 100.0, 260.0]);
     }
 
     #[test]
@@ -861,8 +880,7 @@ mod tests {
         // Position in effective (display) coords — effective page is 792 x 612
         let stamped = stamp_image(&pdf, &img, 100.0, 200.0, 50.0, 60.0).unwrap();
         let cm = extract_cm_from_stamped(&stamped);
-        // Expected: [0, 50, -60, 0, 612-200, 100] = [0, 50, -60, 0, 412, 100]
-        assert_eq!(cm, vec![0.0, 50.0, -60.0, 0.0, 412.0, 100.0]);
+        assert_eq!(cm, vec![0.0, -50.0, -60.0, 0.0, 260.0, 692.0]);
     }
 
     #[test]
@@ -871,7 +889,7 @@ mod tests {
         let img = make_red_png();
         let stamped = stamp_image(&pdf, &img, 100.0, 200.0, 50.0, 60.0).unwrap();
         let cm = extract_cm_from_stamped(&stamped);
-        assert_eq!(cm, vec![-50.0, 0.0, 0.0, -60.0, 512.0, 592.0]);
+        assert_eq!(cm, vec![-50.0, 0.0, 0.0, 60.0, 512.0, 532.0]);
     }
 
     #[test]
@@ -880,7 +898,7 @@ mod tests {
         let img = make_red_png();
         let stamped = stamp_image(&pdf, &img, 100.0, 200.0, 50.0, 60.0).unwrap();
         let cm = extract_cm_from_stamped(&stamped);
-        assert_eq!(cm, vec![0.0, -50.0, 60.0, 0.0, 200.0, 692.0]);
+        assert_eq!(cm, vec![0.0, 50.0, 60.0, 0.0, 352.0, 100.0]);
     }
 
     // -- Tests: stamp_text --------------------------------------------------
