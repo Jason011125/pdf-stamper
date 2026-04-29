@@ -152,6 +152,26 @@ M_total = M_display→raw  ·  M_image→display
 | 180° | `[−w, 0, 0, −h, raw_w − dx, raw_h − dy]` |
 | 270° | `[0, −w, h, 0, dy, raw_h − dx]` |
 
+### The page's existing CTM is NOT identity — wrap it
+
+A correct cm in our Form XObject is necessary but not sufficient. Many real-world PDFs (web-app exports, Notion, Google Docs, …) start their content stream with a top-level `cm` that establishes a top-down "screen" coordinate system, e.g. `0.24 0 0 -0.24 0 841 cm`, and **never** balance it inside a `q ... Q`. End-of-stream CTM is therefore non-identity. If we just append our stamp stream, our `cm` post-composes with the leftover CTM and the stamp ends up scaled / Y-flipped / translated.
+
+`append_content_stream` solves this generically by wrapping the existing Contents in `q ... Q`:
+
+```
+[q_stream, ...existing Contents..., Q_stream, our_stamp_stream]
+```
+
+`q` saves the initial graphics state, the original content runs and may pollute CTM/colors/clipping, `Q` rolls everything back, our stamp then runs from a clean identity state. Independent of what the original PDF does.
+
+Regression covered by `stamp_image_survives_polluted_ctm_in_existing_contents` (synthetic polluted-CTM PDF + pdfium pixel verification). For ad-hoc debug on a customer's PDF, use `diagnose_real_pdf` (`#[ignore]`):
+
+```bash
+DIAGNOSE_PDF=/path/to/file.pdf cargo test --lib diagnose_real_pdf -- --ignored --nocapture
+```
+
+It dumps the existing Contents, runs `stamp_image` with a known red square, renders the result, and reports red-pixel bbox vs. expected.
+
 ### Why pure-arithmetic unit tests aren't enough
 
 The tests that shipped with the broken matrices passed because they compared the function's output against a hand-computed expression that **encoded the same wrong derivation**. The test was effectively `assert(buggy_function() == buggy_expression)`.
@@ -198,8 +218,9 @@ This is a small, focused utility. Keep it minimal:
 
 ## Known Issues / Active Bugs
 
-- **Image stamp 180° flip + offset on non-rotated pages, varied breakage on `/Rotate` pages** *(active)*: `image_cm_for_rotation` in `pdf.rs` has the wrong matrix in all four rotation branches. See the **PDF Image Stamp `cm` Matrix Recipe** section above for the correct derivation.
-- **Text stamp coordinate transform on `/Rotate` pages** *(active, same root cause)*: `coord_cm_for_rotation` in `pdf.rs` uses an inverted display→raw mapping. The user-facing impact is masked because no test verifies text *position* after rotation; existing tests only assert `is_ok()`.
+- **Image stamp 180° flip + offset on non-rotated pages, varied breakage on `/Rotate` pages** *(fixed in 1622433)*: `image_cm_for_rotation` had the wrong matrix in all four rotation branches. Fixed and covered by property-based tests.
+- **Text stamp coordinate transform on `/Rotate` pages** *(fixed in a5410f9)*: `coord_cm_for_rotation` had its 90° and 270° branches swapped. Fixed and covered by round-trip property tests.
+- **Stamp inherits polluted CTM from the existing page Contents** *(fixed in e633776)*: many PDFs leave a non-identity CTM at end of stream; we now wrap existing Contents in `q ... Q` before appending the stamp. Covered by `stamp_image_survives_polluted_ctm_in_existing_contents`.
 - **Transparent PNG renders with white background**: `create_image_xobject()` calls `to_rgb8()` and drops the alpha channel. Fix requires emitting an `SMask` (single-channel DeviceGray Image XObject built from the alpha channel) on the main image XObject.
 - **Output filename collisions silently overwrite**: Two input PDFs with the same filename in different directories produce identical output paths in `stamp_pdfs`. No conflict detection.
 - **Batch progress bar lies**: `stamp_pdfs` runs to completion before returning; the UI's `setExportProgress` only fires once at the end. Need `Channel<T>` or `app.emit` per-file events.
