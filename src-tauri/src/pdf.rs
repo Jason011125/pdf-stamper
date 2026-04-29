@@ -541,13 +541,28 @@ fn register_xobject(
     Ok(())
 }
 
-/// Append a content stream object to the page's Contents entry.
-/// If Contents is a single reference, converts it to an array first.
+/// Append a stamp content stream to the page's Contents, isolating it from
+/// the existing content's graphics state.
+///
+/// Many PDF generators emit a top-level `cm` at the start of the content
+/// stream (typically `[s, 0, 0, -s, 0, page_height]` to use a top-down
+/// "screen-like" coordinate system) that is **not** balanced by a `q ... Q`
+/// pair. Such PDFs leave the CTM non-identity at end-of-stream. If we just
+/// append our stamp content, our `cm` composes with the leftover CTM and
+/// our stamp ends up scaled / flipped.
+///
+/// To stay generic, we wrap the original Contents in `q ... Q` and put our
+/// stamp stream after the closing `Q`. The `Q` rolls back any CTM (and
+/// other graphics-state) changes the original content made, so our stamp
+/// always runs in the page's initial graphics state.
 fn append_content_stream(
     doc: &mut Document,
     page_id: lopdf::ObjectId,
     stream_id: lopdf::ObjectId,
 ) -> Result<(), PdfError> {
+    let q_open_id = doc.add_object(Stream::new(Dictionary::new(), b"q\n".to_vec()));
+    let q_close_id = doc.add_object(Stream::new(Dictionary::new(), b"Q\n".to_vec()));
+
     let page = doc
         .get_object_mut(page_id)
         .map_err(|e| PdfError::StampError(e.to_string()))?;
@@ -561,17 +576,22 @@ fn append_content_stream(
             page_dict.set(
                 "Contents",
                 Object::Array(vec![
+                    Object::Reference(q_open_id),
                     Object::Reference(existing_id),
+                    Object::Reference(q_close_id),
                     Object::Reference(stream_id),
                 ]),
             );
         }
         Ok(Object::Array(arr)) => {
-            let mut new_arr = arr.clone();
+            let mut new_arr = vec![Object::Reference(q_open_id)];
+            new_arr.extend(arr.clone());
+            new_arr.push(Object::Reference(q_close_id));
             new_arr.push(Object::Reference(stream_id));
             page_dict.set("Contents", Object::Array(new_arr));
         }
         _ => {
+            // No existing Contents: nothing to wrap, just set ours.
             page_dict.set("Contents", Object::Reference(stream_id));
         }
     }
@@ -1013,6 +1033,273 @@ mod tests {
         let stamped = stamp_image(&pdf, &img, 100.0, 200.0, 50.0, 60.0).unwrap();
         let cm = cm_vec_to_array(&extract_cm_from_stamped(&stamped));
         assert_stamp_corners_at_display(270, cm, 100.0, 200.0, 50.0, 60.0, 612.0, 792.0);
+    }
+
+    // -- Regression: stamp survives a polluted CTM in existing Contents ----
+    //
+    // Many real-world PDFs (e.g. exports from web-based tools) start their
+    // content stream with a top-level `cm` that is NOT inside a q/Q pair —
+    // typically `[s, 0, 0, -s, 0, page_height]` to use a top-down coordinate
+    // system. End-of-stream CTM is therefore non-identity. We must wrap the
+    // existing Contents in `q ... Q` so our stamp runs in clean state.
+
+    fn make_polluted_ctm_pdf(width: f32, height: f32, ctm: [f32; 6]) -> Vec<u8> {
+        let mut doc = Document::new();
+
+        // Single content stream that begins with the polluted cm and never
+        // restores it. This mimics what real-world generators emit.
+        let body = format!(
+            "{} {} {} {} {} {} cm\n",
+            ctm[0], ctm[1], ctm[2], ctm[3], ctm[4], ctm[5]
+        );
+        let content = Stream::new(Dictionary::new(), body.into_bytes());
+        let content_id = doc.add_object(content);
+
+        let mut page_dict = Dictionary::new();
+        page_dict.set("Type", Name(b"Page".to_vec()));
+        page_dict.set(
+            "MediaBox",
+            Object::Array(vec![
+                0.0f32.into(), 0.0f32.into(), width.into(), height.into(),
+            ]),
+        );
+        page_dict.set("Contents", Object::Reference(content_id));
+        let page_id = doc.add_object(Object::Dictionary(page_dict));
+
+        let mut pages_dict = Dictionary::new();
+        pages_dict.set("Type", Name(b"Pages".to_vec()));
+        pages_dict.set("Count", Object::Integer(1));
+        pages_dict.set("Kids", Object::Array(vec![Object::Reference(page_id)]));
+        let pages_id = doc.add_object(Object::Dictionary(pages_dict));
+
+        let page = doc.get_object_mut(page_id).unwrap();
+        page.as_dict_mut().unwrap().set("Parent", Object::Reference(pages_id));
+
+        let mut catalog = Dictionary::new();
+        catalog.set("Type", Name(b"Catalog".to_vec()));
+        catalog.set("Pages", Object::Reference(pages_id));
+        let catalog_id = doc.add_object(Object::Dictionary(catalog));
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+        bytes
+    }
+
+    fn make_solid_red_png(w: u32, h: u32) -> Vec<u8> {
+        let img = image::RgbImage::from_fn(w, h, |_, _| image::Rgb([255, 0, 0]));
+        let mut bytes = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png).unwrap();
+        bytes
+    }
+
+    /// Render a stamped PDF via pdfium and return the bbox (in render-image
+    /// pixels, y-from-top) of pure red pixels — i.e. where the stamp lies.
+    fn red_bbox_in_render(stamped: &[u8], target_width: u16) -> ((u32, u32), (u32, u32)) {
+        let png = render_page_to_png(stamped, target_width).unwrap();
+        let img = image::load_from_memory(&png).unwrap();
+        let rgba = img.to_rgba8();
+        let (mut x_min, mut x_max) = (u32::MAX, 0u32);
+        let (mut y_min, mut y_max) = (u32::MAX, 0u32);
+        for (x, y, p) in rgba.enumerate_pixels() {
+            if p[0] > 200 && p[1] < 80 && p[2] < 80 {
+                x_min = x_min.min(x); x_max = x_max.max(x);
+                y_min = y_min.min(y); y_max = y_max.max(y);
+            }
+        }
+        assert!(x_min != u32::MAX, "no red pixels found in rendered output");
+        ((x_min, x_max), (y_min, y_max))
+    }
+
+    #[test]
+    fn stamp_image_survives_polluted_ctm_in_existing_contents() {
+        // Polluted CTM: scale 0.5, Y-flip, translate to keep content visible.
+        // This is the exact pattern observed in real exports from web tools.
+        let polluted = [0.5_f32, 0.0, 0.0, -0.5, 0.0, 800.0];
+        let pdf = make_polluted_ctm_pdf(600.0, 800.0, polluted);
+        let img = make_solid_red_png(50, 50);
+
+        let (dx, dy, w, h) = (200.0_f32, 300.0_f32, 100.0_f32, 100.0_f32);
+        let stamped = stamp_image(&pdf, &img, dx, dy, w, h).unwrap();
+
+        let target_w = 600u16;
+        let ((rx_min, rx_max), (ry_min, ry_max)) = red_bbox_in_render(&stamped, target_w);
+
+        // Expected bbox in render coords:
+        //   render scale = target_w / page_w
+        //   x = dx*scale .. (dx+w)*scale
+        //   y_from_top = (page_h - dy - h)*scale .. (page_h - dy)*scale
+        let scale = target_w as f32 / 600.0;
+        let render_h = 800.0 * scale;
+        let exp_x_min = dx * scale;
+        let exp_x_max = (dx + w) * scale;
+        let exp_y_min = render_h - (dy + h) * scale;
+        let exp_y_max = render_h - dy * scale;
+
+        // Allow small tolerance for anti-aliasing at the edges.
+        let tol = 4.0_f32;
+        let close = |actual: u32, expected: f32| (actual as f32 - expected).abs() <= tol;
+        assert!(close(rx_min, exp_x_min) && close(rx_max, exp_x_max),
+            "x bbox: got {}..{}, expected {:.0}..{:.0}", rx_min, rx_max, exp_x_min, exp_x_max);
+        assert!(close(ry_min, exp_y_min) && close(ry_max, exp_y_max),
+            "y bbox: got {}..{}, expected {:.0}..{:.0}", ry_min, ry_max, exp_y_min, exp_y_max);
+    }
+
+    // -- Diagnostic: stamp a real PDF, render via pdfium, locate stamp -----
+    //
+    // Run with:  DIAGNOSE_PDF=/path/to/file.pdf cargo test --lib diagnose_real_pdf -- --ignored --nocapture
+
+    #[test]
+    #[ignore]
+    fn diagnose_real_pdf() {
+        let pdf_path = std::env::var("DIAGNOSE_PDF")
+            .expect("set DIAGNOSE_PDF=/path/to/file.pdf");
+        let pdf_bytes = std::fs::read(&pdf_path).expect("read source pdf");
+
+        // -- Inspect existing Contents stream(s) for q/Q balance and trailing CTM
+        {
+            let doc = Document::load_mem(&pdf_bytes).unwrap();
+            let pid = doc.page_iter().next().unwrap();
+            let page = doc.get_object(pid).unwrap().as_dict().unwrap();
+            let stream_ids: Vec<lopdf::ObjectId> = match page.get(b"Contents").unwrap() {
+                Object::Reference(id) => vec![*id],
+                Object::Array(arr) => arr.iter().filter_map(|o|
+                    if let Object::Reference(i) = o { Some(*i) } else { None }).collect(),
+                _ => vec![],
+            };
+            eprintln!("\nexisting Contents = {} stream(s)", stream_ids.len());
+            let mut q_count = 0i64;
+            let mut last_cm: Option<[f32; 6]> = None;
+            for sid in &stream_ids {
+                if let Ok(Object::Stream(s)) = doc.get_object(*sid) {
+                    let mut sc = s.clone();
+                    let _ = sc.decompress();
+                    let body = String::from_utf8_lossy(&sc.content).to_string();
+                    let toks: Vec<&str> = body.split_whitespace().collect();
+                    for (i, t) in toks.iter().enumerate() {
+                        match *t {
+                            "q" => q_count += 1,
+                            "Q" => q_count -= 1,
+                            "cm" if i >= 6 => {
+                                let mut m = [0.0_f32; 6];
+                                let mut ok = true;
+                                for j in 0..6 {
+                                    match toks[i - 6 + j].parse::<f32>() {
+                                        Ok(v) => m[j] = v,
+                                        Err(_) => { ok = false; break; }
+                                    }
+                                }
+                                if ok { last_cm = Some(m); }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            eprintln!("  q/Q balance after all streams: {} (expected 0; positive = unrestored q on stack)", q_count);
+            if let Some(m) = last_cm {
+                eprintln!("  last cm seen in any stream: [{:.4}, {:.4}, {:.4}, {:.4}, {:.4}, {:.4}]",
+                    m[0], m[1], m[2], m[3], m[4], m[5]);
+            }
+
+            // Dump the existing content streams to /tmp for inspection.
+            let mut all_body = String::new();
+            for sid in &stream_ids {
+                if let Ok(Object::Stream(s)) = doc.get_object(*sid) {
+                    let mut sc = s.clone();
+                    let _ = sc.decompress();
+                    all_body.push_str(&String::from_utf8_lossy(&sc.content));
+                    all_body.push('\n');
+                }
+            }
+            std::fs::write("/tmp/existing-contents.txt", &all_body).unwrap();
+            eprintln!("  full existing content stream dumped to /tmp/existing-contents.txt ({} bytes)", all_body.len());
+        }
+
+        // Also dump the stamped PDF's last content stream (the one we appended)
+        // so we can compare it with what the existing PDF's state expects.
+        {
+            // (continued below — first need stamped, see end of test for dump)
+        }
+
+        // 50×50 solid red, will be drawn at 100×100 — easy to spot in render.
+        let red = image::RgbImage::from_fn(50, 50, |_, _| image::Rgb([255, 0, 0]));
+        let mut img_bytes = Vec::new();
+        red.write_to(&mut std::io::Cursor::new(&mut img_bytes), image::ImageFormat::Png).unwrap();
+
+        let (dx, dy, w, h) = (446.8_f32, 339.0_f32, 100.0_f32, 100.0_f32);
+        let geo = get_page_geometry(&pdf_bytes).unwrap();
+        eprintln!("\nsource PDF:");
+        eprintln!("  raw  dims = {} x {}", geo.raw_width, geo.raw_height);
+        eprintln!("  /Rotate   = {}", geo.rotation);
+        eprintln!("  eff  dims = {} x {}", geo.eff_width, geo.eff_height);
+        eprintln!("stamp params:");
+        eprintln!("  display position (bottom-left of stamp) = ({}, {})", dx, dy);
+        eprintln!("  display size                            = {} x {}", w, h);
+
+        let stamped = stamp_image(&pdf_bytes, &img_bytes, dx, dy, w, h).unwrap();
+        let out_pdf = "/tmp/stamped-diagnostic.pdf";
+        std::fs::write(out_pdf, &stamped).unwrap();
+        eprintln!("\nstamped PDF written to {} ({} bytes)", out_pdf, stamped.len());
+
+        let cm = extract_cm_from_stamped(&stamped);
+        eprintln!("emitted cm                  = [{}]",
+            cm.iter().map(|v| format!("{:.2}", v)).collect::<Vec<_>>().join(", "));
+
+        // Where do the four image corners actually land in the stamped page?
+        let cm_arr = [cm[0], cm[1], cm[2], cm[3], cm[4], cm[5]];
+        for (label, (u, v)) in [
+            ("image bottom-left  unit(0,0)", (0.0_f32, 0.0_f32)),
+            ("image bottom-right unit(1,0)", (1.0, 0.0)),
+            ("image top-left     unit(0,1)", (0.0, 1.0)),
+            ("image top-right    unit(1,1)", (1.0, 1.0)),
+        ] {
+            let raw_x = cm_arr[0] * u + cm_arr[2] * v + cm_arr[4];
+            let raw_y = cm_arr[1] * u + cm_arr[3] * v + cm_arr[5];
+            eprintln!("  {} -> raw ({:.2}, {:.2})", label, raw_x, raw_y);
+        }
+
+        // Render the result and locate the red stamp
+        let png = render_page_to_png(&stamped, 800).unwrap();
+        let out_png = "/tmp/stamped-diagnostic.png";
+        std::fs::write(out_png, &png).unwrap();
+
+        let img = image::load_from_memory(&png).unwrap();
+        let (rw, rh) = (img.width(), img.height());
+        let rgba = img.to_rgba8();
+        let mut x_min = u32::MAX; let mut x_max = 0u32;
+        let mut y_min = u32::MAX; let mut y_max = 0u32;
+        let mut count = 0u32;
+        for (x, y, p) in rgba.enumerate_pixels() {
+            if p[0] > 200 && p[1] < 80 && p[2] < 80 {
+                if x < x_min { x_min = x; }
+                if x > x_max { x_max = x; }
+                if y < y_min { y_min = y; }
+                if y > y_max { y_max = y; }
+                count += 1;
+            }
+        }
+        eprintln!("\nrendered preview image ({}x{}) saved to {}", rw, rh, out_png);
+        if count == 0 {
+            panic!("no red stamp pixels found in rendered output");
+        }
+        eprintln!("red stamp pixel bbox in rendered image:");
+        eprintln!("  x = {}..{} ({:.1}% .. {:.1}% of width)",
+            x_min, x_max, 100.0 * x_min as f32 / rw as f32, 100.0 * x_max as f32 / rw as f32);
+        eprintln!("  y = {}..{} ({:.1}% .. {:.1}% from TOP of image)",
+            y_min, y_max, 100.0 * y_min as f32 / rh as f32, 100.0 * y_max as f32 / rh as f32);
+
+        // Where SHOULD the red stamp land in the rendered image?
+        // Display bbox = (dx, dy) to (dx+w, dy+h) in PDF points (y from bottom).
+        // pdfium renders eff_width:eff_height -> rw:rh at scale rw/eff_width.
+        let scale = rw as f32 / geo.eff_width;
+        let exp_x_min = dx * scale;
+        let exp_x_max = (dx + w) * scale;
+        let exp_y_top_in_render = (geo.eff_height - (dy + h)) * scale;     // top edge of stamp in render (y from top of image)
+        let exp_y_bot_in_render = (geo.eff_height - dy) * scale;
+        eprintln!("expected red bbox if cm is correct (PDF→render):");
+        eprintln!("  x = {:.1}..{:.1}", exp_x_min, exp_x_max);
+        eprintln!("  y = {:.1}..{:.1} (from top of rendered image)", exp_y_top_in_render, exp_y_bot_in_render);
     }
 
     // -- Tests: stamp_text --------------------------------------------------
