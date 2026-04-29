@@ -213,18 +213,37 @@ fn image_cm_for_rotation(
     }
 }
 
-/// Compute the coordinate-space `cm` matrix that transforms display-space
-/// coordinates into raw (unrotated) page-space coordinates.
-/// Used for text stamps where position is set via `Td` in display coords.
+/// Compute the coordinate-space `cm` matrix used for text stamps. After
+/// applying this `cm`, subsequent operations (`Td x y`, `Tj`, …) act in a
+/// coordinate system whose axes and origin coincide with the **display**
+/// (post-`/Rotate`) page, so the caller can use display-space `(x, y)` and
+/// the text renders upright at that display position.
+///
+/// Returns `None` for `/Rotate=0` (no transform needed).
+///
+/// The previous implementation derived this as the rotation that maps raw
+/// to display, which is the inverse of what `cm` actually needs (`cm` maps
+/// the *new* coordinate system to the *outer* one — here, display → raw).
+/// The 90° and 270° branches were swapped because raw→display and its
+/// inverse coincide only at /Rotate=180.
 fn coord_cm_for_rotation(rotation: u32, raw_w: f32, raw_h: f32) -> Option<[f32; 6]> {
-    // For 90° CW:  display (u,v) → raw (v, raw_h − u)  → matrix [0,−1, 1,0, 0,raw_h]
-    // For 180°:    display (u,v) → raw (raw_w−u, raw_h−v) → matrix [−1,0,0,−1,raw_w,raw_h]
-    // For 270° CW: display (u,v) → raw (raw_w−v, u)   → matrix [0, 1,−1,0,raw_w,0]
+    // Display → raw, derived from the inverse of T_rotate (raw → display):
+    //   /Rotate= 90 CW: T_rotate (u, v)_raw → (v, raw_w − u)_display
+    //                   inverse  (x, y)_display → (raw_w − y, x)_raw
+    //                   cm = [0, 1, −1, 0, raw_w, 0]
+    //   /Rotate=180:    T_rotate (u, v)_raw → (raw_w − u, raw_h − v)_display
+    //                   inverse  (x, y)_display → (raw_w − x, raw_h − y)_raw
+    //                   cm = [−1, 0, 0, −1, raw_w, raw_h]
+    //   /Rotate=270 CW: T_rotate (u, v)_raw → (raw_h − v, u)_display
+    //                   inverse  (x, y)_display → (y, raw_h − x)_raw
+    //                   cm = [0, −1, 1, 0, 0, raw_h]
+    //
+    // Verified by `text_coord_cm_maps_display_back_to_display` in tests.
     match rotation {
-        90  => Some([0.0, -1.0,  1.0, 0.0, 0.0,   raw_h]),
-        180 => Some([-1.0, 0.0, 0.0, -1.0, raw_w, raw_h]),
-        270 => Some([0.0,  1.0, -1.0, 0.0, raw_w, 0.0]),
-        _   => None, // 0° needs no extra transform
+        90  => Some([ 0.0,  1.0, -1.0,  0.0, raw_w, 0.0  ]),
+        180 => Some([-1.0,  0.0,  0.0, -1.0, raw_w, raw_h]),
+        270 => Some([ 0.0, -1.0,  1.0,  0.0, 0.0,   raw_h]),
+        _   => None,
     }
 }
 
@@ -894,18 +913,58 @@ mod tests {
         assert_stamp_corners_at_display(90, cm, 50.0, 30.0, 200.0, 80.0, 1000.0, 400.0);
     }
 
-    // -- Tests: coord_cm_for_rotation --------------------------------------
+    // -- Tests: coord_cm_for_rotation (property-based) ---------------------
 
     #[test]
     fn coord_cm_rotation_0_is_none() {
         assert!(coord_cm_for_rotation(0, 612.0, 792.0).is_none());
     }
 
+    /// Verify that for every test display point, applying `cm` (display→raw)
+    /// followed by `T_rotate` (raw→display) returns the original display
+    /// point. This pins down both the linear part and the translation of the
+    /// affine map without re-encoding the same matrix expression in the test.
+    fn assert_coord_cm_roundtrips(rotation: u32, raw_w: f32, raw_h: f32) {
+        let cm = coord_cm_for_rotation(rotation, raw_w, raw_h)
+            .expect("non-zero rotation should produce a cm");
+        let display_points: [(f32, f32); 5] = [
+            (0.0, 0.0),
+            (100.0, 200.0),
+            (50.0, 30.0),
+            (raw_w / 2.0, raw_h / 2.0),
+            (1.0, 0.0), // probes orientation: must stay on the +x axis after roundtrip
+        ];
+        for &(dx, dy) in &display_points {
+            let raw = apply_cm(cm, (dx, dy));
+            let back = apply_t_rotate(rotation, raw, raw_w, raw_h);
+            assert!(
+                (back.0 - dx).abs() < 0.01 && (back.1 - dy).abs() < 0.01,
+                "rotation={}, display=({}, {}): cm+T_rotate landed at {:?}",
+                rotation, dx, dy, back,
+            );
+        }
+    }
+
     #[test]
-    fn coord_cm_rotation_90() {
-        // display→raw (90° CW): (u,v)→(v, raw_h-u) → matrix [0,-1,1,0,0,raw_h]
-        let m = coord_cm_for_rotation(90, 612.0, 792.0).unwrap();
-        assert_eq!(m, [0.0, -1.0, 1.0, 0.0, 0.0, 792.0]);
+    fn coord_cm_rotation_90_roundtrips() {
+        assert_coord_cm_roundtrips(90, 612.0, 792.0);
+    }
+
+    #[test]
+    fn coord_cm_rotation_180_roundtrips() {
+        assert_coord_cm_roundtrips(180, 612.0, 792.0);
+    }
+
+    #[test]
+    fn coord_cm_rotation_270_roundtrips() {
+        assert_coord_cm_roundtrips(270, 612.0, 792.0);
+    }
+
+    #[test]
+    fn coord_cm_rotation_landscape_page() {
+        // Non-square page exposes any matrix that mixes raw_w and raw_h.
+        assert_coord_cm_roundtrips(90, 1000.0, 400.0);
+        assert_coord_cm_roundtrips(270, 1000.0, 400.0);
     }
 
     // -- Tests: stamp_image full pipeline (property-based) -----------------
