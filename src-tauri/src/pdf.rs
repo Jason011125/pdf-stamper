@@ -754,50 +754,6 @@ mod tests {
         bytes
     }
 
-    /// Extract the cm matrix values from the Form XObject's content stream in a stamped PDF.
-    fn extract_cm_from_stamped(pdf_bytes: &[u8]) -> Vec<f32> {
-        let doc = Document::load_mem(pdf_bytes).unwrap();
-        let page_id = doc.page_iter().next().unwrap();
-        let page = doc.get_object(page_id).unwrap();
-        let page_dict = page.as_dict().unwrap();
-
-        // Find the stamp Form XObject in Resources
-        let res = match page_dict.get(b"Resources").unwrap() {
-            Object::Reference(id) => doc.get_object(*id).unwrap().as_dict().unwrap().clone(),
-            Object::Dictionary(d) => d.clone(),
-            _ => panic!("unexpected Resources type"),
-        };
-        let xobjects = match res.get(b"XObject").unwrap() {
-            Object::Reference(id) => doc.get_object(*id).unwrap().as_dict().unwrap().clone(),
-            Object::Dictionary(d) => d.clone(),
-            _ => panic!("unexpected XObject type"),
-        };
-
-        // Find the Stamp* entry
-        for (name, val) in xobjects.iter() {
-            let name_str = std::str::from_utf8(name).unwrap_or("");
-            if name_str.starts_with("Stamp") {
-                if let Object::Reference(id) = val {
-                    if let Ok(Object::Stream(s)) = doc.get_object(*id) {
-                        let mut sc = s.clone();
-                        let _ = sc.decompress();
-                        let txt = String::from_utf8_lossy(&sc.content);
-                        // Parse "... a b c d e f cm ..."
-                        let parts: Vec<&str> = txt.split_whitespace().collect();
-                        for (i, &part) in parts.iter().enumerate() {
-                            if part == "cm" && i >= 6 {
-                                return (i-6..i)
-                                    .map(|j| parts[j].parse::<f32>().unwrap())
-                                    .collect();
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        panic!("no cm operator found in stamp Form XObject");
-    }
-
     // -- Tests: get_page_geometry ------------------------------------------
 
     #[test]
@@ -852,13 +808,11 @@ mod tests {
         assert!((h - 612.0).abs() < 0.1);
     }
 
-    // -- Tests: image_cm_for_rotation (property-based) ---------------------
+    // -- Content-stream replay helpers ------------------------------------
     //
-    // We do NOT compare matrix values against hand-computed expressions —
-    // that would just encode the same bug pattern that shipped in c6a9a80.
-    // Instead, for each unit-square corner of the image, verify that
-    // (image → raw via cm) + (raw → display via T_rotate) lands at the
-    // expected display-space corner of the user-picked stamp rectangle.
+    // These helpers parse a stamped PDF's page content streams (all of them,
+    // in order) and find exactly where the stamp Form XObject lands after
+    // accounting for the full accumulated CTM.
 
     fn apply_cm(cm: [f32; 6], (u, v): (f32, f32)) -> (f32, f32) {
         (cm[0] * u + cm[2] * v + cm[4], cm[1] * u + cm[3] * v + cm[5])
@@ -874,63 +828,530 @@ mod tests {
         }
     }
 
-    /// For each unit-square corner of the image, assert that after applying
-    /// `cm` (image → raw) and then `T_rotate` (raw → display), the corner
-    /// lands at the matching corner of the user-picked stamp rectangle.
-    fn assert_stamp_corners_at_display(
+    /// Matrix multiply: result(p) = A(B(p)).
+    /// Both matrices are [a, b, c, d, e, f] representing the affine map
+    /// (x,y) → (a*x + c*y + e, b*x + d*y + f).
+    fn mat_mul(a: [f32; 6], b: [f32; 6]) -> [f32; 6] {
+        [
+            a[0] * b[0] + a[2] * b[1],
+            a[1] * b[0] + a[3] * b[1],
+            a[0] * b[2] + a[2] * b[3],
+            a[1] * b[2] + a[3] * b[3],
+            a[0] * b[4] + a[2] * b[5] + a[4],
+            a[1] * b[4] + a[3] * b[5] + a[5],
+        ]
+    }
+
+    /// Compose a chain of matrices so that the first entry is applied first.
+    /// compose([A, B, C])(p) = C(B(A(p))).
+    fn compose(ms: &[[f32; 6]]) -> [f32; 6] {
+        let id = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+        ms.iter().fold(id, |acc, &m| mat_mul(m, acc))
+    }
+
+    /// Assert values are equal within tolerance.
+    fn assert_close((ax, ay): (f32, f32), (bx, by): (f32, f32), tol: f32) {
+        assert!(
+            (ax - bx).abs() < tol && (ay - by).abs() < tol,
+            "expected ({}, {}) but got ({}, {}) — delta ({}, {})",
+            bx, by, ax, ay, (ax - bx).abs(), (ay - by).abs(),
+        );
+    }
+
+    /// Tokenize a PDF content stream into individual tokens.
+    /// Understands: numbers, names (/foo), literal strings ((foo)),
+    /// hex strings (<ab cd>), and bare operator words.
+    fn tokenize_content(data: &[u8]) -> Vec<String> {
+        let mut tokens = Vec::new();
+        let mut i = 0;
+        while i < data.len() {
+            match data[i] {
+                b' ' | b'\t' | b'\r' | b'\n' => { i += 1; }
+                b'%' => {
+                    // Comment — skip to end of line.
+                    while i < data.len() && data[i] != b'\n' && data[i] != b'\r' { i += 1; }
+                }
+                b'(' => {
+                    // Literal string with balanced parens and escapes.
+                    let mut s = String::from("(");
+                    i += 1;
+                    let mut depth = 1usize;
+                    while i < data.len() && depth > 0 {
+                        match data[i] {
+                            b'\\' => { s.push('\\'); i += 1; if i < data.len() { s.push(data[i] as char); i += 1; } }
+                            b'(' => { depth += 1; s.push('('); i += 1; }
+                            b')' => { depth -= 1; if depth > 0 { s.push(')'); } else { s.push(')'); } i += 1; }
+                            c    => { s.push(c as char); i += 1; }
+                        }
+                    }
+                    tokens.push(s);
+                }
+                b'<' if i + 1 < data.len() && data[i + 1] == b'<' => {
+                    // Dictionary — capture as single token (we don't need to parse it).
+                    let mut s = String::from("<<");
+                    i += 2;
+                    let mut depth = 1usize;
+                    while i + 1 < data.len() && depth > 0 {
+                        if data[i] == b'<' && data[i + 1] == b'<' { depth += 1; s.push_str("<<"); i += 2; }
+                        else if data[i] == b'>' && data[i + 1] == b'>' { depth -= 1; s.push_str(">>"); i += 2; }
+                        else { s.push(data[i] as char); i += 1; }
+                    }
+                    tokens.push(s);
+                }
+                b'<' => {
+                    // Hex string.
+                    let mut s = String::from("<");
+                    i += 1;
+                    while i < data.len() && data[i] != b'>' { s.push(data[i] as char); i += 1; }
+                    if i < data.len() { s.push('>'); i += 1; }
+                    tokens.push(s);
+                }
+                b'[' | b']' => {
+                    tokens.push((data[i] as char).to_string());
+                    i += 1;
+                }
+                _ => {
+                    // Number, name, or operator — read until whitespace or delimiter.
+                    let start = i;
+                    while i < data.len() && !matches!(data[i], b' '|b'\t'|b'\r'|b'\n'|b'('|b')'|b'<'|b'>'|b'['|b']'|b'{'|b'}') {
+                        i += 1;
+                    }
+                    if i > start {
+                        tokens.push(String::from_utf8_lossy(&data[start..i]).into_owned());
+                    }
+                }
+            }
+        }
+        tokens
+    }
+
+    /// Information about where a stamp Form XObject was invoked.
+    struct StampPlacement {
+        /// CTM on the page at the moment `Do /StampN` executes.
+        page_ctm: [f32; 6],
+        /// The Form's /Matrix (identity if absent).
+        form_matrix: [f32; 6],
+        /// The Form's /BBox = [llx, lly, urx, ury].
+        form_bbox: [f32; 4],
+        /// The last `cm` applied inside the Form before `Do /Img0`.
+        inner_cm: [f32; 6],
+    }
+
+    /// Walk page content streams, maintaining a CTM stack. Returns the CTM
+    /// at the moment a `Do /StampNNN` invocation is encountered.
+    /// Panics if no stamp is found.
+    fn parse_stamp_placement(pdf_bytes: &[u8]) -> StampPlacement {
+        let doc = Document::load_mem(pdf_bytes)
+            .expect("parse_stamp_placement: load_mem failed");
+        let page_id = doc.page_iter().next()
+            .expect("parse_stamp_placement: no pages");
+        let page_dict = doc.get_object(page_id).unwrap().as_dict().unwrap().clone();
+
+        // Collect all content stream IDs in order.
+        let stream_ids: Vec<lopdf::ObjectId> = match page_dict.get(b"Contents").unwrap() {
+            Object::Reference(id) => vec![*id],
+            Object::Array(arr) => arr.iter().filter_map(|o| {
+                if let Object::Reference(id) = o { Some(*id) } else { None }
+            }).collect(),
+            _ => panic!("unexpected Contents type"),
+        };
+
+        // Concatenate and tokenize all streams.
+        let mut all_bytes: Vec<u8> = Vec::new();
+        for sid in &stream_ids {
+            if let Ok(Object::Stream(s)) = doc.get_object(*sid) {
+                let mut sc = s.clone();
+                let _ = sc.decompress();
+                all_bytes.extend_from_slice(&sc.content);
+                all_bytes.push(b'\n');
+            }
+        }
+        let tokens = tokenize_content(&all_bytes);
+
+        // Walk tokens, maintain CTM stack.
+        let identity = [1.0_f32, 0.0, 0.0, 1.0, 0.0, 0.0];
+        let mut ctm_stack: Vec<[f32; 6]> = vec![identity];
+        let mut i = 0;
+        while i < tokens.len() {
+            match tokens[i].as_str() {
+                "q" => {
+                    let top = *ctm_stack.last().expect("q: empty stack");
+                    ctm_stack.push(top);
+                    i += 1;
+                }
+                "Q" => {
+                    ctm_stack.pop().expect("Q: unbalanced Q");
+                    i += 1;
+                }
+                "cm" => {
+                    // 6 numbers precede "cm".
+                    assert!(i >= 6, "cm: not enough tokens before");
+                    let mut args = [0.0_f32; 6];
+                    for (j, a) in args.iter_mut().enumerate() {
+                        *a = tokens[i - 6 + j].parse::<f32>()
+                            .unwrap_or_else(|_| panic!("cm arg {}: not a float: {:?}", j, tokens[i - 6 + j]));
+                    }
+                    let old = *ctm_stack.last().expect("cm: empty stack");
+                    // PDF §8.4.4: new CTM = cm_args × old CTM
+                    *ctm_stack.last_mut().unwrap() = mat_mul(args, old);
+                    i += 1;
+                }
+                "Do" => {
+                    // Operand is the token immediately before "Do".
+                    assert!(i >= 1, "Do: no operand");
+                    let name = tokens[i - 1].trim_start_matches('/').to_string();
+                    if name.starts_with("Stamp") {
+                        let page_ctm = *ctm_stack.last().expect("Do: empty stack");
+                        // Look up the Form XObject.
+                        let (form_matrix, form_bbox, inner_cm) =
+                            read_form_xobject(&doc, &page_dict, &name);
+                        return StampPlacement { page_ctm, form_matrix, form_bbox, inner_cm };
+                    }
+                    i += 1;
+                }
+                op => {
+                    // We don't need to parse all operators; skip known no-ops.
+                    // Known operators we skip: rg, g, w, re, f, W, n, j, J, M, d, i, ri, gs, BT, ET, Tf, Td, Tj, Tm, Th, Tc, Tw, Tz, TL, Tr, Ts, T*, etc.
+                    // Unknown operators that take operands: just skip — the operand
+                    // tokens were already consumed by the time we get here.
+                    let _ = op;
+                    i += 1;
+                }
+            }
+        }
+        panic!("parse_stamp_placement: no Do /StampN found in page streams");
+    }
+
+    /// Read form matrix, bbox, and inner_cm from the Form XObject.
+    fn read_form_xobject(
+        doc: &Document,
+        page_dict: &lopdf::Dictionary,
+        form_name: &str,
+    ) -> ([f32; 6], [f32; 4], [f32; 6]) {
+        let identity = [1.0_f32, 0.0, 0.0, 1.0, 0.0, 0.0];
+
+        // Resolve Resources/XObject
+        let res_obj = match page_dict.get(b"Resources").unwrap() {
+            Object::Reference(id) => doc.get_object(*id).unwrap().as_dict().unwrap().clone(),
+            Object::Dictionary(d) => d.clone(),
+            _ => panic!("bad Resources"),
+        };
+        let xobj_dict = match res_obj.get(b"XObject").unwrap() {
+            Object::Reference(id) => doc.get_object(*id).unwrap().as_dict().unwrap().clone(),
+            Object::Dictionary(d) => d.clone(),
+            _ => panic!("bad XObject"),
+        };
+
+        let form_id = match xobj_dict.get(form_name.as_bytes()).unwrap() {
+            Object::Reference(id) => *id,
+            _ => panic!("form entry is not a reference"),
+        };
+        let form_stream = match doc.get_object(form_id).unwrap() {
+            Object::Stream(s) => s.clone(),
+            _ => panic!("form is not a stream"),
+        };
+
+        // /Matrix
+        let form_matrix = if let Ok(Object::Array(arr)) = form_stream.dict.get(b"Matrix") {
+            let v: Vec<f32> = arr.iter().map(|o| obj_as_f32(o).unwrap_or(0.0)).collect();
+            if v.len() == 6 { [v[0], v[1], v[2], v[3], v[4], v[5]] } else { identity }
+        } else { identity };
+
+        // /BBox
+        let form_bbox = if let Ok(Object::Array(arr)) = form_stream.dict.get(b"BBox") {
+            let v: Vec<f32> = arr.iter().map(|o| obj_as_f32(o).unwrap_or(0.0)).collect();
+            if v.len() == 4 { [v[0], v[1], v[2], v[3]] } else { [0.0, 0.0, 1.0, 1.0] }
+        } else { [0.0, 0.0, 1.0, 1.0] };
+
+        // Decompress and tokenize the form's content stream.
+        let mut sc = form_stream.clone();
+        let _ = sc.decompress();
+        let tokens = tokenize_content(&sc.content);
+
+        // Walk form tokens: look for `cm` before `Do /Img0` or before `BT`.
+        let mut inner_cm = identity;
+        let mut i = 0;
+        while i < tokens.len() {
+            match tokens[i].as_str() {
+                "cm" => {
+                    assert!(i >= 6, "form cm: not enough tokens");
+                    let mut args = [0.0_f32; 6];
+                    for (j, a) in args.iter_mut().enumerate() {
+                        *a = tokens[i - 6 + j].parse::<f32>()
+                            .unwrap_or_else(|_| panic!("form cm arg {}: {:?}", j, tokens[i - 6 + j]));
+                    }
+                    inner_cm = args;
+                    i += 1;
+                }
+                "Do" | "BT" => {
+                    // Found the operator we care about — stop.
+                    break;
+                }
+                _ => { i += 1; }
+            }
+        }
+
+        (form_matrix, form_bbox, inner_cm)
+    }
+
+    /// Information about where a text stamp was placed.
+    struct TextPlacement {
+        /// CTM on the page at `Do /StampN`.
+        page_ctm: [f32; 6],
+        /// Form's /Matrix (identity if absent).
+        form_matrix: [f32; 6],
+        /// Last `cm` inside the Form before BT.
+        inner_cm: [f32; 6],
+        /// The (x, y) args from the `Td` operator inside BT..ET.
+        text_origin: (f32, f32),
+        /// The size arg from the `Tf` operator.
+        font_size: f32,
+    }
+
+    /// Like parse_stamp_placement but also captures text operators inside the Form.
+    fn parse_text_placement(pdf_bytes: &[u8]) -> TextPlacement {
+        let doc = Document::load_mem(pdf_bytes)
+            .expect("parse_text_placement: load_mem failed");
+        let page_id = doc.page_iter().next()
+            .expect("parse_text_placement: no pages");
+        let page_dict = doc.get_object(page_id).unwrap().as_dict().unwrap().clone();
+
+        let stream_ids: Vec<lopdf::ObjectId> = match page_dict.get(b"Contents").unwrap() {
+            Object::Reference(id) => vec![*id],
+            Object::Array(arr) => arr.iter().filter_map(|o| {
+                if let Object::Reference(id) = o { Some(*id) } else { None }
+            }).collect(),
+            _ => panic!("unexpected Contents type"),
+        };
+
+        let mut all_bytes: Vec<u8> = Vec::new();
+        for sid in &stream_ids {
+            if let Ok(Object::Stream(s)) = doc.get_object(*sid) {
+                let mut sc = s.clone();
+                let _ = sc.decompress();
+                all_bytes.extend_from_slice(&sc.content);
+                all_bytes.push(b'\n');
+            }
+        }
+        let tokens = tokenize_content(&all_bytes);
+
+        let identity = [1.0_f32, 0.0, 0.0, 1.0, 0.0, 0.0];
+        let mut ctm_stack: Vec<[f32; 6]> = vec![identity];
+        let mut i = 0;
+        while i < tokens.len() {
+            match tokens[i].as_str() {
+                "q" => { let t = *ctm_stack.last().unwrap(); ctm_stack.push(t); i += 1; }
+                "Q" => { ctm_stack.pop().unwrap(); i += 1; }
+                "cm" => {
+                    assert!(i >= 6);
+                    let mut args = [0.0_f32; 6];
+                    for (j, a) in args.iter_mut().enumerate() {
+                        *a = tokens[i - 6 + j].parse::<f32>()
+                            .unwrap_or_else(|_| panic!("cm arg {}: {:?}", j, &tokens[i-6+j]));
+                    }
+                    let old = *ctm_stack.last().unwrap();
+                    *ctm_stack.last_mut().unwrap() = mat_mul(args, old);
+                    i += 1;
+                }
+                "Do" => {
+                    assert!(i >= 1);
+                    let name = tokens[i - 1].trim_start_matches('/').to_string();
+                    if name.starts_with("Stamp") {
+                        let page_ctm = *ctm_stack.last().unwrap();
+                        let (form_matrix, _form_bbox, inner_cm, text_origin, font_size) =
+                            read_form_text_xobject(&doc, &page_dict, &name);
+                        return TextPlacement { page_ctm, form_matrix, inner_cm, text_origin, font_size };
+                    }
+                    i += 1;
+                }
+                _ => { i += 1; }
+            }
+        }
+        panic!("parse_text_placement: no Do /StampN found");
+    }
+
+    /// Read form details for a text stamp Form XObject.
+    fn read_form_text_xobject(
+        doc: &Document,
+        page_dict: &lopdf::Dictionary,
+        form_name: &str,
+    ) -> ([f32; 6], [f32; 4], [f32; 6], (f32, f32), f32) {
+        let identity = [1.0_f32, 0.0, 0.0, 1.0, 0.0, 0.0];
+
+        let res_obj = match page_dict.get(b"Resources").unwrap() {
+            Object::Reference(id) => doc.get_object(*id).unwrap().as_dict().unwrap().clone(),
+            Object::Dictionary(d) => d.clone(),
+            _ => panic!("bad Resources"),
+        };
+        let xobj_dict = match res_obj.get(b"XObject").unwrap() {
+            Object::Reference(id) => doc.get_object(*id).unwrap().as_dict().unwrap().clone(),
+            Object::Dictionary(d) => d.clone(),
+            _ => panic!("bad XObject"),
+        };
+
+        let form_id = match xobj_dict.get(form_name.as_bytes()).unwrap() {
+            Object::Reference(id) => *id,
+            _ => panic!("form entry is not a reference"),
+        };
+        let form_stream = match doc.get_object(form_id).unwrap() {
+            Object::Stream(s) => s.clone(),
+            _ => panic!("form is not a stream"),
+        };
+
+        let form_matrix = if let Ok(Object::Array(arr)) = form_stream.dict.get(b"Matrix") {
+            let v: Vec<f32> = arr.iter().map(|o| obj_as_f32(o).unwrap_or(0.0)).collect();
+            if v.len() == 6 { [v[0], v[1], v[2], v[3], v[4], v[5]] } else { identity }
+        } else { identity };
+
+        let form_bbox = if let Ok(Object::Array(arr)) = form_stream.dict.get(b"BBox") {
+            let v: Vec<f32> = arr.iter().map(|o| obj_as_f32(o).unwrap_or(0.0)).collect();
+            if v.len() == 4 { [v[0], v[1], v[2], v[3]] } else { [0.0, 0.0, 1.0, 1.0] }
+        } else { [0.0, 0.0, 1.0, 1.0] };
+
+        let mut sc = form_stream.clone();
+        let _ = sc.decompress();
+        let tokens = tokenize_content(&sc.content);
+
+        let mut inner_cm = identity;
+        let mut font_size = 0.0_f32;
+        let mut text_origin = (0.0_f32, 0.0_f32);
+        let mut i = 0;
+        while i < tokens.len() {
+            match tokens[i].as_str() {
+                "cm" => {
+                    assert!(i >= 6);
+                    let mut args = [0.0_f32; 6];
+                    for (j, a) in args.iter_mut().enumerate() {
+                        *a = tokens[i - 6 + j].parse::<f32>()
+                            .unwrap_or_else(|_| panic!("form cm arg {}: {:?}", j, &tokens[i-6+j]));
+                    }
+                    inner_cm = args;
+                    i += 1;
+                }
+                "Tf" => {
+                    // /FontName size Tf
+                    assert!(i >= 2, "Tf: not enough operands");
+                    font_size = tokens[i - 1].parse::<f32>()
+                        .unwrap_or_else(|_| panic!("Tf size: {:?}", &tokens[i-1]));
+                    i += 1;
+                }
+                "Td" => {
+                    // x y Td
+                    assert!(i >= 2, "Td: not enough operands");
+                    let x = tokens[i - 2].parse::<f32>()
+                        .unwrap_or_else(|_| panic!("Td x: {:?}", &tokens[i-2]));
+                    let y = tokens[i - 1].parse::<f32>()
+                        .unwrap_or_else(|_| panic!("Td y: {:?}", &tokens[i-1]));
+                    text_origin = (x, y);
+                    i += 1;
+                }
+                _ => { i += 1; }
+            }
+        }
+
+        (form_matrix, form_bbox, inner_cm, text_origin, font_size)
+    }
+
+    /// Assert that a stamped image PDF places the stamp at the expected
+    /// display-space rectangle, using full content-stream replay.
+    fn assert_stamp_renders_at_display(
+        stamped_pdf: &[u8],
         rotation: u32,
-        cm: [f32; 6],
-        dx: f32, dy: f32,
-        w: f32, h: f32,
         raw_w: f32, raw_h: f32,
+        expected_dx: f32, expected_dy: f32,
+        expected_w: f32, expected_h: f32,
     ) {
-        let cases: [((f32, f32), (f32, f32)); 4] = [
-            ((0.0, 0.0), (dx,     dy)),       // image bottom-left → stamp BL
-            ((1.0, 0.0), (dx + w, dy)),       // image bottom-right → stamp BR
-            ((0.0, 1.0), (dx,     dy + h)),   // image top-left → stamp TL
-            ((1.0, 1.0), (dx + w, dy + h)),   // image top-right → stamp TR
-        ];
-        for (unit, expected) in cases {
+        let p = parse_stamp_placement(stamped_pdf);
+        let cm = compose(&[p.inner_cm, p.form_matrix, p.page_ctm]);
+
+        for (unit, expected_disp) in [
+            ((0.0_f32, 0.0_f32), (expected_dx,               expected_dy)),
+            ((1.0_f32, 0.0_f32), (expected_dx + expected_w,  expected_dy)),
+            ((0.0_f32, 1.0_f32), (expected_dx,               expected_dy + expected_h)),
+            ((1.0_f32, 1.0_f32), (expected_dx + expected_w,  expected_dy + expected_h)),
+        ] {
             let raw = apply_cm(cm, unit);
             let disp = apply_t_rotate(rotation, raw, raw_w, raw_h);
-            assert!(
-                (disp.0 - expected.0).abs() < 0.01 && (disp.1 - expected.1).abs() < 0.01,
-                "rotation={}, unit={:?}: stamp corner landed at display={:?}, expected={:?}",
-                rotation, unit, disp, expected,
-            );
+            assert_close(disp, expected_disp, 0.5);
         }
+
+        // Form BBox must contain the unit square.
+        let [llx, lly, urx, ury] = p.form_bbox;
+        assert!(llx <= 0.0 && lly <= 0.0 && urx >= 1.0 && ury >= 1.0,
+            "Form BBox {:?} does not cover unit square", p.form_bbox);
+    }
+
+    /// Assert that a stamped text PDF places the text origin at the expected
+    /// display-space position.
+    fn assert_text_renders_at_display(
+        stamped_pdf: &[u8],
+        rotation: u32,
+        raw_w: f32, raw_h: f32,
+        expected_dx: f32, expected_dy: f32,
+        expected_font_size: f32,
+    ) {
+        let p = parse_text_placement(stamped_pdf);
+        assert!(
+            (p.font_size - expected_font_size).abs() < 0.5,
+            "font_size: expected {} got {}", expected_font_size, p.font_size,
+        );
+
+        // Text matrix = identity at BT; Td x y sets translation.
+        // Text origin in the Form's local coordinate system is (text_origin.0, text_origin.1).
+        let text_matrix = [1.0_f32, 0.0, 0.0, 1.0, p.text_origin.0, p.text_origin.1];
+        let cm = compose(&[text_matrix, p.inner_cm, p.form_matrix, p.page_ctm]);
+        let raw = apply_cm(cm, (0.0, 0.0));
+        let disp = apply_t_rotate(rotation, raw, raw_w, raw_h);
+        assert_close(disp, (expected_dx, expected_dy), 0.5);
+    }
+
+    // -- Tests: stamp_image full pipeline (content-stream replay) ----------
+    //
+    // Build a real stamped PDF, replay all page content streams to find
+    // exactly where the stamp lands, and assert the display-space position
+    // matches what was requested. This catches wrong matrix derivations even
+    // if the test expectations are copied from the same source as the
+    // implementation (c6a9a80 pattern).
+
+    #[test]
+    fn stamp_image_lands_at_display_no_rotation() {
+        let pdf = make_test_pdf(612.0, 792.0, None);
+        let img = make_red_png();
+        let stamped = stamp_image(&pdf, &img, 100.0, 200.0, 150.0, 75.0).unwrap();
+        assert_stamp_renders_at_display(&stamped, 0, 612.0, 792.0, 100.0, 200.0, 150.0, 75.0);
     }
 
     #[test]
-    fn image_stamp_corners_no_rotation() {
-        let cm = image_cm_for_rotation(0, 100.0, 200.0, 50.0, 60.0, 612.0, 792.0);
-        assert_stamp_corners_at_display(0, cm, 100.0, 200.0, 50.0, 60.0, 612.0, 792.0);
+    fn stamp_image_lands_at_display_rotation_90() {
+        let pdf = make_test_pdf(612.0, 792.0, Some(90));
+        let img = make_red_png();
+        let stamped = stamp_image(&pdf, &img, 100.0, 200.0, 150.0, 75.0).unwrap();
+        assert_stamp_renders_at_display(&stamped, 90, 612.0, 792.0, 100.0, 200.0, 150.0, 75.0);
     }
 
     #[test]
-    fn image_stamp_corners_rotation_90() {
-        let cm = image_cm_for_rotation(90, 100.0, 200.0, 50.0, 60.0, 612.0, 792.0);
-        assert_stamp_corners_at_display(90, cm, 100.0, 200.0, 50.0, 60.0, 612.0, 792.0);
+    fn stamp_image_lands_at_display_rotation_180() {
+        let pdf = make_test_pdf(612.0, 792.0, Some(180));
+        let img = make_red_png();
+        let stamped = stamp_image(&pdf, &img, 100.0, 200.0, 150.0, 75.0).unwrap();
+        assert_stamp_renders_at_display(&stamped, 180, 612.0, 792.0, 100.0, 200.0, 150.0, 75.0);
     }
 
     #[test]
-    fn image_stamp_corners_rotation_180() {
-        let cm = image_cm_for_rotation(180, 100.0, 200.0, 50.0, 60.0, 612.0, 792.0);
-        assert_stamp_corners_at_display(180, cm, 100.0, 200.0, 50.0, 60.0, 612.0, 792.0);
+    fn stamp_image_lands_at_display_rotation_270() {
+        let pdf = make_test_pdf(612.0, 792.0, Some(270));
+        let img = make_red_png();
+        let stamped = stamp_image(&pdf, &img, 100.0, 200.0, 150.0, 75.0).unwrap();
+        assert_stamp_renders_at_display(&stamped, 270, 612.0, 792.0, 100.0, 200.0, 150.0, 75.0);
     }
 
     #[test]
-    fn image_stamp_corners_rotation_270() {
-        let cm = image_cm_for_rotation(270, 100.0, 200.0, 50.0, 60.0, 612.0, 792.0);
-        assert_stamp_corners_at_display(270, cm, 100.0, 200.0, 50.0, 60.0, 612.0, 792.0);
-    }
-
-    #[test]
-    fn image_stamp_corners_landscape_page_rotation_90() {
-        // Different page aspect ratio + non-trivial offset to catch matrices
-        // that happen to be correct for square-ish pages but wrong elsewhere.
-        let cm = image_cm_for_rotation(90, 50.0, 30.0, 200.0, 80.0, 1000.0, 400.0);
-        assert_stamp_corners_at_display(90, cm, 50.0, 30.0, 200.0, 80.0, 1000.0, 400.0);
+    fn stamp_image_lands_at_display_landscape_rotation_90() {
+        // Non-square page: exercises matrices that only work for square pages.
+        let pdf = make_test_pdf(1000.0, 400.0, Some(90));
+        let img = make_red_png();
+        let stamped = stamp_image(&pdf, &img, 50.0, 30.0, 200.0, 80.0).unwrap();
+        assert_stamp_renders_at_display(&stamped, 90, 1000.0, 400.0, 50.0, 30.0, 200.0, 80.0);
     }
 
     // -- Tests: coord_cm_for_rotation (property-based) ---------------------
@@ -985,54 +1406,6 @@ mod tests {
         // Non-square page exposes any matrix that mixes raw_w and raw_h.
         assert_coord_cm_roundtrips(90, 1000.0, 400.0);
         assert_coord_cm_roundtrips(270, 1000.0, 400.0);
-    }
-
-    // -- Tests: stamp_image full pipeline (property-based) -----------------
-    //
-    // End-to-end check: build a PDF, run stamp_image, extract the cm that
-    // the stamping code emitted into the Form XObject, and verify the same
-    // post-rotation corner property as the unit tests above. This catches
-    // any regression in either image_cm_for_rotation or how stamp_image
-    // wires it into the Form XObject content stream.
-
-    fn cm_vec_to_array(v: &[f32]) -> [f32; 6] {
-        [v[0], v[1], v[2], v[3], v[4], v[5]]
-    }
-
-    #[test]
-    fn stamp_image_lands_at_display_no_rotation() {
-        let pdf = make_test_pdf(612.0, 792.0, None);
-        let img = make_red_png();
-        let stamped = stamp_image(&pdf, &img, 100.0, 200.0, 50.0, 60.0).unwrap();
-        let cm = cm_vec_to_array(&extract_cm_from_stamped(&stamped));
-        assert_stamp_corners_at_display(0, cm, 100.0, 200.0, 50.0, 60.0, 612.0, 792.0);
-    }
-
-    #[test]
-    fn stamp_image_lands_at_display_rotation_90() {
-        let pdf = make_test_pdf(612.0, 792.0, Some(90));
-        let img = make_red_png();
-        let stamped = stamp_image(&pdf, &img, 100.0, 200.0, 50.0, 60.0).unwrap();
-        let cm = cm_vec_to_array(&extract_cm_from_stamped(&stamped));
-        assert_stamp_corners_at_display(90, cm, 100.0, 200.0, 50.0, 60.0, 612.0, 792.0);
-    }
-
-    #[test]
-    fn stamp_image_lands_at_display_rotation_180() {
-        let pdf = make_test_pdf(612.0, 792.0, Some(180));
-        let img = make_red_png();
-        let stamped = stamp_image(&pdf, &img, 100.0, 200.0, 50.0, 60.0).unwrap();
-        let cm = cm_vec_to_array(&extract_cm_from_stamped(&stamped));
-        assert_stamp_corners_at_display(180, cm, 100.0, 200.0, 50.0, 60.0, 612.0, 792.0);
-    }
-
-    #[test]
-    fn stamp_image_lands_at_display_rotation_270() {
-        let pdf = make_test_pdf(612.0, 792.0, Some(270));
-        let img = make_red_png();
-        let stamped = stamp_image(&pdf, &img, 100.0, 200.0, 50.0, 60.0).unwrap();
-        let cm = cm_vec_to_array(&extract_cm_from_stamped(&stamped));
-        assert_stamp_corners_at_display(270, cm, 100.0, 200.0, 50.0, 60.0, 612.0, 792.0);
     }
 
     // -- Regression: stamp survives a polluted CTM in existing Contents ----
@@ -1216,12 +1589,6 @@ mod tests {
             eprintln!("  full existing content stream dumped to /tmp/existing-contents.txt ({} bytes)", all_body.len());
         }
 
-        // Also dump the stamped PDF's last content stream (the one we appended)
-        // so we can compare it with what the existing PDF's state expects.
-        {
-            // (continued below — first need stamped, see end of test for dump)
-        }
-
         // 50×50 solid red, will be drawn at 100×100 — easy to spot in render.
         let red = image::RgbImage::from_fn(50, 50, |_, _| image::Rgb([255, 0, 0]));
         let mut img_bytes = Vec::new();
@@ -1242,64 +1609,9 @@ mod tests {
         std::fs::write(out_pdf, &stamped).unwrap();
         eprintln!("\nstamped PDF written to {} ({} bytes)", out_pdf, stamped.len());
 
-        let cm = extract_cm_from_stamped(&stamped);
-        eprintln!("emitted cm                  = [{}]",
-            cm.iter().map(|v| format!("{:.2}", v)).collect::<Vec<_>>().join(", "));
-
-        // Where do the four image corners actually land in the stamped page?
-        let cm_arr = [cm[0], cm[1], cm[2], cm[3], cm[4], cm[5]];
-        for (label, (u, v)) in [
-            ("image bottom-left  unit(0,0)", (0.0_f32, 0.0_f32)),
-            ("image bottom-right unit(1,0)", (1.0, 0.0)),
-            ("image top-left     unit(0,1)", (0.0, 1.0)),
-            ("image top-right    unit(1,1)", (1.0, 1.0)),
-        ] {
-            let raw_x = cm_arr[0] * u + cm_arr[2] * v + cm_arr[4];
-            let raw_y = cm_arr[1] * u + cm_arr[3] * v + cm_arr[5];
-            eprintln!("  {} -> raw ({:.2}, {:.2})", label, raw_x, raw_y);
-        }
-
-        // Render the result and locate the red stamp
-        let png = render_page_to_png(&stamped, 800).unwrap();
-        let out_png = "/tmp/stamped-diagnostic.png";
-        std::fs::write(out_png, &png).unwrap();
-
-        let img = image::load_from_memory(&png).unwrap();
-        let (rw, rh) = (img.width(), img.height());
-        let rgba = img.to_rgba8();
-        let mut x_min = u32::MAX; let mut x_max = 0u32;
-        let mut y_min = u32::MAX; let mut y_max = 0u32;
-        let mut count = 0u32;
-        for (x, y, p) in rgba.enumerate_pixels() {
-            if p[0] > 200 && p[1] < 80 && p[2] < 80 {
-                if x < x_min { x_min = x; }
-                if x > x_max { x_max = x; }
-                if y < y_min { y_min = y; }
-                if y > y_max { y_max = y; }
-                count += 1;
-            }
-        }
-        eprintln!("\nrendered preview image ({}x{}) saved to {}", rw, rh, out_png);
-        if count == 0 {
-            panic!("no red stamp pixels found in rendered output");
-        }
-        eprintln!("red stamp pixel bbox in rendered image:");
-        eprintln!("  x = {}..{} ({:.1}% .. {:.1}% of width)",
-            x_min, x_max, 100.0 * x_min as f32 / rw as f32, 100.0 * x_max as f32 / rw as f32);
-        eprintln!("  y = {}..{} ({:.1}% .. {:.1}% from TOP of image)",
-            y_min, y_max, 100.0 * y_min as f32 / rh as f32, 100.0 * y_max as f32 / rh as f32);
-
-        // Where SHOULD the red stamp land in the rendered image?
-        // Display bbox = (dx, dy) to (dx+w, dy+h) in PDF points (y from bottom).
-        // pdfium renders eff_width:eff_height -> rw:rh at scale rw/eff_width.
-        let scale = rw as f32 / geo.eff_width;
-        let exp_x_min = dx * scale;
-        let exp_x_max = (dx + w) * scale;
-        let exp_y_top_in_render = (geo.eff_height - (dy + h)) * scale;     // top edge of stamp in render (y from top of image)
-        let exp_y_bot_in_render = (geo.eff_height - dy) * scale;
-        eprintln!("expected red bbox if cm is correct (PDF→render):");
-        eprintln!("  x = {:.1}..{:.1}", exp_x_min, exp_x_max);
-        eprintln!("  y = {:.1}..{:.1} (from top of rendered image)", exp_y_top_in_render, exp_y_bot_in_render);
+        // Assert via content-stream replay: stamp must land at the expected display rect.
+        assert_stamp_renders_at_display(&stamped, geo.rotation, geo.raw_width, geo.raw_height, dx, dy, w, h);
+        eprintln!("assert_stamp_renders_at_display passed — stamp lands at ({}, {}) size {}x{}", dx, dy, w, h);
     }
 
     // -- Tests: stamp_text --------------------------------------------------
@@ -1307,19 +1619,41 @@ mod tests {
     #[test]
     fn stamp_text_no_rotation() {
         let pdf = make_test_pdf(612.0, 792.0, None);
-        let result = stamp_text(&pdf, "TEST", 100.0, 200.0, 24.0, "Helvetica", None);
-        assert!(result.is_ok());
-        // Verify the output is a valid PDF
-        let output = result.unwrap();
-        let geo = get_page_geometry(&output).unwrap();
-        assert_eq!(geo.rotation, 0);
+        let stamped = stamp_text(&pdf, "TEST", 100.0, 200.0, 24.0, "Helvetica", None).unwrap();
+        assert_text_renders_at_display(&stamped, 0, 612.0, 792.0, 100.0, 200.0, 24.0);
     }
 
     #[test]
     fn stamp_text_rotation_90() {
         let pdf = make_test_pdf(612.0, 792.0, Some(90));
-        let result = stamp_text(&pdf, "TEST", 100.0, 200.0, 24.0, "Helvetica", None);
-        assert!(result.is_ok());
+        let stamped = stamp_text(&pdf, "TEST", 100.0, 200.0, 24.0, "Helvetica", None).unwrap();
+        assert_text_renders_at_display(&stamped, 90, 612.0, 792.0, 100.0, 200.0, 24.0);
+    }
+
+    #[test]
+    fn stamp_text_rotation_180() {
+        let pdf = make_test_pdf(612.0, 792.0, Some(180));
+        let stamped = stamp_text(&pdf, "TEST", 100.0, 200.0, 24.0, "Helvetica", None).unwrap();
+        assert_text_renders_at_display(&stamped, 180, 612.0, 792.0, 100.0, 200.0, 24.0);
+    }
+
+    #[test]
+    fn stamp_text_rotation_270() {
+        // Sanity-checked by hand for /Rotate=270:
+        //   coord_cm_for_rotation(270) = [0, -1, 1, 0, 0, raw_h]
+        //   inner_cm = [0, -1, 1, 0, 0, raw_h] = [0,-1,1,0,0,792]
+        //   text_origin = (dx, dy) = (100, 200) via Td
+        //   text_matrix = [1,0,0,1,100,200]
+        //   compose([text_matrix, inner_cm, identity, identity]):
+        //     step1: inner_cm ∘ text_matrix:
+        //       result[4] = 0*100 + 1*200 + 0 = 200
+        //       result[5] = -1*100 + 0*200 + 792 = 692
+        //     raw point = (200, 692)
+        //   apply_t_rotate(270, (200,692), 612, 792):
+        //     = (raw_h - ry, rx) = (792 - 692, 200) = (100, 200) ✓
+        let pdf = make_test_pdf(612.0, 792.0, Some(270));
+        let stamped = stamp_text(&pdf, "TEST", 100.0, 200.0, 24.0, "Helvetica", None).unwrap();
+        assert_text_renders_at_display(&stamped, 270, 612.0, 792.0, 100.0, 200.0, 24.0);
     }
 
     // -- Tests: parse_hex_color -------------------------------------------
