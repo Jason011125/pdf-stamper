@@ -12,6 +12,17 @@ async function readImagePreview(path: string): Promise<string> {
   return URL.createObjectURL(blob);
 }
 
+async function readImageDimensions(url: string): Promise<{ w: number; h: number }> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve({ w: img.naturalWidth, h: img.naturalHeight });
+    img.onerror = reject;
+    img.src = url;
+  });
+}
+
+const DEFAULT_STAMP_LONG_SIDE = 100;
+
 export function StampControls(): React.JSX.Element {
   const files = usePdfStore((s) => s.files);
 
@@ -30,6 +41,10 @@ export function StampControls(): React.JSX.Element {
   const widthPt = useStampStore((s) => s.widthPt);
   const heightPt = useStampStore((s) => s.heightPt);
   const setSize = useStampStore((s) => s.setSize);
+  const lockAspect = useStampStore((s) => s.lockAspect);
+  const setLockAspect = useStampStore((s) => s.setLockAspect);
+  const lockedAspect = useStampStore((s) => s.lockedAspect);
+  const setLockedAspect = useStampStore((s) => s.setLockedAspect);
   const xPt = useStampStore((s) => s.xPt);
   const yPt = useStampStore((s) => s.yPt);
   const isPlaced = useStampStore((s) => s.isPlaced);
@@ -48,8 +63,73 @@ export function StampControls(): React.JSX.Element {
 
     const path = typeof selected === 'string' ? selected : selected;
     const previewUrl = await readImagePreview(path);
+
+    // Snap stamp box to the image's natural aspect so the preview's blue box
+    // matches what gets exported. Long side defaults to DEFAULT_STAMP_LONG_SIDE.
+    // The aspect is captured into the store so subsequent edits in lock mode
+    // survive any intermediate 0/NaN typed into the W or H field.
+    try {
+      const { w: natW, h: natH } = await readImageDimensions(previewUrl);
+      if (natW > 0 && natH > 0) {
+        const aspect = natW / natH;
+        const longSide = DEFAULT_STAMP_LONG_SIDE;
+        const newW = aspect >= 1 ? longSide : longSide * aspect;
+        const newH = aspect >= 1 ? longSide / aspect : longSide;
+        setLockedAspect(aspect);
+        setSize(newW, newH);
+      }
+    } catch {
+      // Fall through with whatever size is already set if the image fails to load
+      // for dimension probing — the user can still edit W/H manually.
+    }
+
     setImage(path, previewUrl);
-  }, [setImage]);
+  }, [setImage, setSize, setLockedAspect]);
+
+  const handleWidthChange = useCallback(
+    (newW: number) => {
+      if (!Number.isFinite(newW) || newW <= 0) {
+        // Allow the input to display 0/empty during typing, but don't propagate
+        // a degenerate value into store — keeps locked aspect intact.
+        setSize(Math.max(0, newW), heightPt);
+        return;
+      }
+      if (lockAspect && lockedAspect > 0) {
+        setSize(newW, newW / lockedAspect);
+      } else {
+        setSize(newW, heightPt);
+      }
+    },
+    [lockAspect, lockedAspect, heightPt, setSize],
+  );
+
+  const handleHeightChange = useCallback(
+    (newH: number) => {
+      if (!Number.isFinite(newH) || newH <= 0) {
+        setSize(widthPt, Math.max(0, newH));
+        return;
+      }
+      if (lockAspect && lockedAspect > 0) {
+        setSize(newH * lockedAspect, newH);
+      } else {
+        setSize(widthPt, newH);
+      }
+    },
+    [lockAspect, lockedAspect, widthPt, setSize],
+  );
+
+  // When the user toggles lock back ON, capture the *current* W/H ratio so
+  // they can lock to whatever (possibly distorted) shape they just made.
+  // Falls back to the existing lockedAspect if W or H is currently 0.
+  const handleLockChange = useCallback(
+    (locked: boolean) => {
+      if (locked && widthPt > 0 && heightPt > 0) {
+        setLockedAspect(widthPt / heightPt);
+      }
+      setLockAspect(locked);
+    },
+    [widthPt, heightPt, setLockAspect, setLockedAspect],
+  );
 
   const handleApplyAll = useCallback(async () => {
     if (files.length === 0 || !isPlaced) return;
@@ -175,20 +255,32 @@ export function StampControls(): React.JSX.Element {
 
       {/* Stamp dimensions */}
       <div className="space-y-1">
-        <span className="text-xs text-gray-500">Stamp Size (points)</span>
-        <div className="flex gap-2">
+        <div className="flex items-center justify-between">
+          <span className="text-xs text-gray-500">Stamp Size (points)</span>
+          <label className="flex items-center gap-1 text-xs text-gray-500 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={lockAspect}
+              onChange={(e) => handleLockChange(e.target.checked)}
+              className="cursor-pointer"
+            />
+            Lock aspect
+          </label>
+        </div>
+        <div className="flex items-center gap-2">
           <input
             type="number"
-            value={widthPt}
-            onChange={(e) => setSize(Number(e.target.value), heightPt)}
+            value={Math.round(widthPt * 10) / 10}
+            onChange={(e) => handleWidthChange(Number(e.target.value))}
             min={10}
             className="w-20 rounded-md border border-gray-300 px-2 py-1 text-sm"
             placeholder="W"
           />
+          <span className="text-xs text-gray-400">{lockAspect ? '↔' : '✕'}</span>
           <input
             type="number"
-            value={heightPt}
-            onChange={(e) => setSize(widthPt, Number(e.target.value))}
+            value={Math.round(heightPt * 10) / 10}
+            onChange={(e) => handleHeightChange(Number(e.target.value))}
             min={10}
             className="w-20 rounded-md border border-gray-300 px-2 py-1 text-sm"
             placeholder="H"

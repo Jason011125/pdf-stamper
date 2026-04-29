@@ -14,6 +14,12 @@ interface StampStore {
   yPt: number;
   widthPt: number;
   heightPt: number;
+  lockAspect: boolean;
+  /** Aspect ratio (widthPt / heightPt) preserved while lockAspect is on.
+   * Stored explicitly so it survives intermediate 0 / invalid values the
+   * user may type while editing W/H — deriving aspect from current
+   * widthPt/heightPt would corrupt to NaN or 0/Infinity in that window. */
+  lockedAspect: number;
   isPlaced: boolean;
   isExporting: boolean;
   exportProgress: { current: number; total: number };
@@ -27,6 +33,8 @@ interface StampStore {
   setColor: (color: string) => void;
   setPosition: (xPt: number, yPt: number) => void;
   setSize: (widthPt: number, heightPt: number) => void;
+  setLockAspect: (locked: boolean) => void;
+  setLockedAspect: (aspect: number) => void;
   setPlaced: (placed: boolean) => void;
   setExporting: (exporting: boolean) => void;
   setExportProgress: (current: number, total: number) => void;
@@ -44,6 +52,8 @@ export const useStampStore = create<StampStore>((set) => ({
   yPt: 0,
   widthPt: 100,
   heightPt: 100,
+  lockAspect: true,
+  lockedAspect: 1,
   isPlaced: false,
   isExporting: false,
   exportProgress: { current: 0, total: 0 },
@@ -61,6 +71,8 @@ export const useStampStore = create<StampStore>((set) => ({
   setColor: (color) => set({ color }),
   setPosition: (xPt, yPt) => set({ xPt, yPt }),
   setSize: (widthPt, heightPt) => set({ widthPt, heightPt }),
+  setLockAspect: (locked) => set({ lockAspect: locked }),
+  setLockedAspect: (aspect) => set({ lockedAspect: aspect }),
   setPlaced: (placed) => set({ isPlaced: placed }),
   setExporting: (exporting) => set({ isExporting: exporting }),
   setExportProgress: (current, total) =>

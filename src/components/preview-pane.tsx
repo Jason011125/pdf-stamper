@@ -247,7 +247,11 @@ export function PreviewPane(): React.JSX.Element {
               <img
                 src={imagePreviewUrl}
                 alt="stamp"
-                className="w-full h-full object-contain pointer-events-none"
+                // object-fill: the preview must show exactly what the export produces.
+                // The export stretches the image to fill (widthPt × heightPt); using
+                // object-contain here would silently letterbox and mislead the user.
+                // Aspect lock + auto-snap on upload keep this from distorting in normal use.
+                className="w-full h-full object-fill pointer-events-none"
                 draggable={false}
               />
             )}
