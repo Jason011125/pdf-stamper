@@ -103,8 +103,78 @@ src/
 The store keeps stamp position in **PDF points** (`xPt`, `yPt` = bottom-left corner of stamp).
 `preview-pane.tsx` has `toScreenPos()` and `toPdfPos()` to convert between systems.
 
-### Page Rotation
-PDF pages may have a `/Rotate` entry (0, 90, 180, 270 degrees CW). The `get_page_geometry()` function handles this and returns both raw and effective (as-displayed) dimensions. pdfium renders with rotation applied, so the preview matches viewer display.
+### Three coordinate spaces in the Rust side
+
+When a PDF has `/Rotate ≠ 0`, three spaces matter:
+
+1. **Image space** — internal to a PDF Image XObject. Origin top-left, Y down. Sample (0, 0) is the source image's top-left pixel.
+2. **Raw page space** — what `MediaBox` measures. Origin bottom-left, Y up. This is what gets written into the PDF content stream.
+3. **Display space** — what the viewer (and our preview) actually shows. Same handedness as raw, but rotated by `/Rotate` degrees CW.
+
+The user picks stamp positions in **display space**. We store them as `(xPt, yPt, widthPt, heightPt)` in display units. The Rust side converts to **raw space** when emitting the stamp's `cm` matrix.
+
+## PDF Image Stamp `cm` Matrix Recipe
+
+> ⚠️ This is the most error-prone code in the project. The previous implementation had every rotation case wrong (commit c6a9a80 confidently introduced a 180° flip while claiming to fix one). **Read this section before modifying `image_cm_for_rotation` in `pdf.rs`.**
+
+### Image XObject sample → unit-square mapping (PDF 1.7 §8.9.5)
+
+A PDF Image XObject is drawn into the **unit square** in user space (corners at `(0, 0)` and `(1, 1)`). The image's *first* sample (top-left of the source image) lands at unit **(0, 1)**; the *last* sample lands at unit **(1, 0)**. PDF already accounts for the top-down storage vs. bottom-up user space — **no manual Y flip is needed**.
+
+→ The minimal "draw image upright at PDF position `(x, y)` with size `(w, h)`" matrix is just `[w, 0, 0, h, x, y]`. Anything with a negative `d` is wrong (or is doing something exotic).
+
+### `/Rotate` semantics (PDF 1.7 §14.8.2)
+
+`/Rotate` is applied *after* content rendering, by the viewer. So we draw in **raw space**, and the viewer then rotates the whole page CW by `R°` to produce the **display**.
+
+The viewer's transform `T_rotate` (raw → display) for a raw page of size `(raw_w, raw_h)`:
+
+| `R` | `T_rotate(u, v)` |
+|-----|------------------|
+| 0°   | `(u, v)` |
+| 90°  | `(v, raw_w − u)` |
+| 180° | `(raw_w − u, raw_h − v)` |
+| 270° | `(raw_h − v, u)` |
+
+To put an upright stamp at *display* `(dx, dy)` with size `(w, h)`, we compose:
+
+```
+M_total = M_display→raw  ·  M_image→display
+        = T_rotate⁻¹     ·  [w, 0, 0, h, dx, dy]
+```
+
+### The four cm matrices (`image_cm_for_rotation` in `pdf.rs`)
+
+| `/Rotate` | cm = `[a, b, c, d, e, f]` |
+|-----------|-----------------------------|
+| 0°   | `[w, 0, 0, h, dx, dy]` |
+| 90°  | `[0, w, −h, 0, raw_w − dy, dx]` |
+| 180° | `[−w, 0, 0, −h, raw_w − dx, raw_h − dy]` |
+| 270° | `[0, −w, h, 0, dy, raw_h − dx]` |
+
+### Why pure-arithmetic unit tests aren't enough
+
+The tests that shipped with the broken matrices passed because they compared the function's output against a hand-computed expression that **encoded the same wrong derivation**. The test was effectively `assert(buggy_function() == buggy_expression)`.
+
+**Use property-based tests instead.** For each rotation, verify the stamp's *display-space corners after the viewer's rotation* land where the user picked. The helper pattern:
+
+```rust
+fn assert_stamp_lands_at_display(rot, dx, dy, w, h, raw_w, raw_h) {
+    let cm = image_cm_for_rotation(rot, dx, dy, w, h, raw_w, raw_h);
+    for (unit_corner, expected_display_corner) in [
+        ((0.0, 0.0), (dx,     dy)),       // image bottom-left → stamp BL
+        ((1.0, 0.0), (dx + w, dy)),       // image bottom-right → stamp BR
+        ((0.0, 1.0), (dx,     dy + h)),   // image top-left → stamp TL
+        ((1.0, 1.0), (dx + w, dy + h)),   // image top-right → stamp TR
+    ] {
+        let raw  = apply_cm(cm, unit_corner);
+        let disp = apply_t_rotate(rot, raw, raw_w, raw_h);
+        assert_close(disp, expected_display_corner);
+    }
+}
+```
+
+This tests the *property we care about* (stamp lands at the user-picked display rectangle, upright) rather than the matrix's exact bit pattern, so it stays correct even if someone refactors the math.
 
 ## Scope
 
@@ -128,8 +198,12 @@ This is a small, focused utility. Keep it minimal:
 
 ## Known Issues / Active Bugs
 
-- **Stamp position/orientation mismatch on rotated pages**: Pages with `/Rotate` cause the stamp to appear at the wrong position and potentially flipped in the saved PDF. The fix requires transforming stamp coordinates based on page rotation in `stamp_image()` and `stamp_text()`.
-- **Inherited MediaBox**: Some PDFs inherit MediaBox from parent Pages nodes. `get_page_geometry()` now handles this by walking up the page tree.
+- **Image stamp 180° flip + offset on non-rotated pages, varied breakage on `/Rotate` pages** *(active)*: `image_cm_for_rotation` in `pdf.rs` has the wrong matrix in all four rotation branches. See the **PDF Image Stamp `cm` Matrix Recipe** section above for the correct derivation.
+- **Text stamp coordinate transform on `/Rotate` pages** *(active, same root cause)*: `coord_cm_for_rotation` in `pdf.rs` uses an inverted display→raw mapping. The user-facing impact is masked because no test verifies text *position* after rotation; existing tests only assert `is_ok()`.
+- **Transparent PNG renders with white background**: `create_image_xobject()` calls `to_rgb8()` and drops the alpha channel. Fix requires emitting an `SMask` (single-channel DeviceGray Image XObject built from the alpha channel) on the main image XObject.
+- **Output filename collisions silently overwrite**: Two input PDFs with the same filename in different directories produce identical output paths in `stamp_pdfs`. No conflict detection.
+- **Batch progress bar lies**: `stamp_pdfs` runs to completion before returning; the UI's `setExportProgress` only fires once at the end. Need `Channel<T>` or `app.emit` per-file events.
+- **Inherited MediaBox** *(handled)*: Some PDFs inherit `MediaBox` from parent `Pages` nodes. `get_page_geometry()` walks up the page tree to resolve it.
 
 ## Build & Run
 
