@@ -183,28 +183,33 @@ pub fn render_page_to_png(pdf_bytes: &[u8], target_width: u16) -> Result<Vec<u8>
     Ok(png_bytes)
 }
 
-/// Compute the `cm` matrix [a, b, c, d, e, f] for placing an image stamp,
-/// transforming from effective (displayed) coordinates to raw (unrotated) page space.
+/// Compute the `cm` matrix [a, b, c, d, e, f] for placing an image stamp at
+/// display position `(dx, dy)` with display size `(sw, sh)` on a page whose
+/// raw MediaBox is `(raw_w, raw_h)` and whose `/Rotate` is `rotation` degrees CW.
 ///
-/// The image maps from unit square [0,0]-[1,1] to the target rectangle.
-/// For rotated pages the stamp must be counter-rotated so it appears upright
-/// in the displayed (rotated) view.
+/// PDF Image XObject convention (PDF 1.7 §8.9.5): the source image's first
+/// sample (top-left) maps to unit-square (0, 1) and the last (bottom-right)
+/// to (1, 0). The minimal "upright at (x, y) sized (w, h)" matrix is therefore
+/// `[w, 0, 0, h, x, y]` — no Y flip.
+///
+/// For rotated pages, the viewer applies `T_rotate` (raw → display) at render
+/// time; we compose `M_display→raw · M_image→display` so that, after the viewer
+/// rotates by `rotation`° CW, the stamp lands upright at display `(dx, dy)`.
+///
+/// **Do not modify without re-verifying via the property-based tests** in this
+/// module (see `assert_stamp_corners_at_display`). The full derivation lives
+/// in `.claude/CLAUDE.md` under "PDF Image Stamp `cm` Matrix Recipe".
 fn image_cm_for_rotation(
     rotation: u32,
     dx: f32, dy: f32,
     sw: f32, sh: f32,
     raw_w: f32, raw_h: f32,
 ) -> [f32; 6] {
-    // PDF images have their first sample at (0,1) in unit-square space (top-left pixel
-    // maps to the upper-left of the drawn rectangle). To place an image without vertical
-    // flip, the height component must be negated and the y-origin shifted by sh.
-    // Each rotation case is derived from the display→raw coordinate transform composed
-    // with the image-coordinate→display transform.
     match rotation {
-        90  => [0.0, -sw, -sh, 0.0, dy + sh, raw_h - dx],
-        180 => [-sw, 0.0, 0.0,  sh, raw_w - dx, raw_h - dy - sh],
-        270 => [0.0,  sw,  sh, 0.0, raw_w - dy - sh, dx],
-        _   => [sw,  0.0, 0.0, -sh, dx, dy + sh], // 0° — correct orientation
+        90  => [0.0,  sw, -sh, 0.0, raw_w - dy, dx],
+        180 => [-sw, 0.0, 0.0, -sh, raw_w - dx, raw_h - dy],
+        270 => [0.0, -sw,  sh, 0.0, dy, raw_h - dx],
+        _   => [sw,  0.0, 0.0,  sh, dx, dy],
     }
 }
 
@@ -808,44 +813,85 @@ mod tests {
         assert!((h - 612.0).abs() < 0.1);
     }
 
-    // -- Tests: image_cm_for_rotation --------------------------------------
+    // -- Tests: image_cm_for_rotation (property-based) ---------------------
+    //
+    // We do NOT compare matrix values against hand-computed expressions —
+    // that would just encode the same bug pattern that shipped in c6a9a80.
+    // Instead, for each unit-square corner of the image, verify that
+    // (image → raw via cm) + (raw → display via T_rotate) lands at the
+    // expected display-space corner of the user-picked stamp rectangle.
 
-    #[test]
-    fn cm_rotation_0() {
-        // dx=100, dy=200, sw=50, sh=60
-        // Correct: [sw, 0, 0, -sh, dx, dy+sh] = [50, 0, 0, -60, 100, 260]
-        let [a, b, c, d, e, f] = image_cm_for_rotation(0, 100.0, 200.0, 50.0, 60.0, 612.0, 792.0);
-        assert_eq!([a, b, c, d, e, f], [50.0, 0.0, 0.0, -60.0, 100.0, 260.0]);
+    fn apply_cm(cm: [f32; 6], (u, v): (f32, f32)) -> (f32, f32) {
+        (cm[0] * u + cm[2] * v + cm[4], cm[1] * u + cm[3] * v + cm[5])
+    }
+
+    /// Apply the viewer's raw → display rotation (CW by `rotation` degrees).
+    fn apply_t_rotate(rotation: u32, (rx, ry): (f32, f32), raw_w: f32, raw_h: f32) -> (f32, f32) {
+        match rotation {
+            90  => (ry, raw_w - rx),
+            180 => (raw_w - rx, raw_h - ry),
+            270 => (raw_h - ry, rx),
+            _   => (rx, ry),
+        }
+    }
+
+    /// For each unit-square corner of the image, assert that after applying
+    /// `cm` (image → raw) and then `T_rotate` (raw → display), the corner
+    /// lands at the matching corner of the user-picked stamp rectangle.
+    fn assert_stamp_corners_at_display(
+        rotation: u32,
+        cm: [f32; 6],
+        dx: f32, dy: f32,
+        w: f32, h: f32,
+        raw_w: f32, raw_h: f32,
+    ) {
+        let cases: [((f32, f32), (f32, f32)); 4] = [
+            ((0.0, 0.0), (dx,     dy)),       // image bottom-left → stamp BL
+            ((1.0, 0.0), (dx + w, dy)),       // image bottom-right → stamp BR
+            ((0.0, 1.0), (dx,     dy + h)),   // image top-left → stamp TL
+            ((1.0, 1.0), (dx + w, dy + h)),   // image top-right → stamp TR
+        ];
+        for (unit, expected) in cases {
+            let raw = apply_cm(cm, unit);
+            let disp = apply_t_rotate(rotation, raw, raw_w, raw_h);
+            assert!(
+                (disp.0 - expected.0).abs() < 0.01 && (disp.1 - expected.1).abs() < 0.01,
+                "rotation={}, unit={:?}: stamp corner landed at display={:?}, expected={:?}",
+                rotation, unit, disp, expected,
+            );
+        }
     }
 
     #[test]
-    fn cm_rotation_90() {
-        // dx=100, dy=200, sw=50, sh=60, W=612, H=792
-        // display→raw (90° CW): (u,v)→(v, H-u)
-        // (0,0)→TL=(dy+sh, H-dx)=(260,692), (1,0)→TR=(260,642), (0,1)→BL=(200,692)
-        // Correct: [0, -sw, -sh, 0, dy+sh, H-dx] = [0, -50, -60, 0, 260, 692]
-        let [a, b, c, d, e, f] = image_cm_for_rotation(90, 100.0, 200.0, 50.0, 60.0, 612.0, 792.0);
-        assert_eq!([a, b, c, d, e, f], [0.0, -50.0, -60.0, 0.0, 260.0, 692.0]);
+    fn image_stamp_corners_no_rotation() {
+        let cm = image_cm_for_rotation(0, 100.0, 200.0, 50.0, 60.0, 612.0, 792.0);
+        assert_stamp_corners_at_display(0, cm, 100.0, 200.0, 50.0, 60.0, 612.0, 792.0);
     }
 
     #[test]
-    fn cm_rotation_180() {
-        // dx=100, dy=200, sw=50, sh=60, W=612, H=792
-        // display→raw (180°): (u,v)→(W-u, H-v)
-        // (0,0)→TL=(W-dx, H-dy-sh)=(512,532)
-        // Correct: [-sw, 0, 0, sh, W-dx, H-dy-sh] = [-50, 0, 0, 60, 512, 532]
-        let [a, b, c, d, e, f] = image_cm_for_rotation(180, 100.0, 200.0, 50.0, 60.0, 612.0, 792.0);
-        assert_eq!([a, b, c, d, e, f], [-50.0, 0.0, 0.0, 60.0, 512.0, 532.0]);
+    fn image_stamp_corners_rotation_90() {
+        let cm = image_cm_for_rotation(90, 100.0, 200.0, 50.0, 60.0, 612.0, 792.0);
+        assert_stamp_corners_at_display(90, cm, 100.0, 200.0, 50.0, 60.0, 612.0, 792.0);
     }
 
     #[test]
-    fn cm_rotation_270() {
-        // dx=100, dy=200, sw=50, sh=60, W=612, H=792
-        // display→raw (270° CW): (u,v)→(W-v, u)
-        // (0,0)→TL=(W-dy-sh, dx)=(352,100)
-        // Correct: [0, sw, sh, 0, W-dy-sh, dx] = [0, 50, 60, 0, 352, 100]
-        let [a, b, c, d, e, f] = image_cm_for_rotation(270, 100.0, 200.0, 50.0, 60.0, 612.0, 792.0);
-        assert_eq!([a, b, c, d, e, f], [0.0, 50.0, 60.0, 0.0, 352.0, 100.0]);
+    fn image_stamp_corners_rotation_180() {
+        let cm = image_cm_for_rotation(180, 100.0, 200.0, 50.0, 60.0, 612.0, 792.0);
+        assert_stamp_corners_at_display(180, cm, 100.0, 200.0, 50.0, 60.0, 612.0, 792.0);
+    }
+
+    #[test]
+    fn image_stamp_corners_rotation_270() {
+        let cm = image_cm_for_rotation(270, 100.0, 200.0, 50.0, 60.0, 612.0, 792.0);
+        assert_stamp_corners_at_display(270, cm, 100.0, 200.0, 50.0, 60.0, 612.0, 792.0);
+    }
+
+    #[test]
+    fn image_stamp_corners_landscape_page_rotation_90() {
+        // Different page aspect ratio + non-trivial offset to catch matrices
+        // that happen to be correct for square-ish pages but wrong elsewhere.
+        let cm = image_cm_for_rotation(90, 50.0, 30.0, 200.0, 80.0, 1000.0, 400.0);
+        assert_stamp_corners_at_display(90, cm, 50.0, 30.0, 200.0, 80.0, 1000.0, 400.0);
     }
 
     // -- Tests: coord_cm_for_rotation --------------------------------------
@@ -862,43 +908,52 @@ mod tests {
         assert_eq!(m, [0.0, -1.0, 1.0, 0.0, 0.0, 792.0]);
     }
 
-    // -- Tests: stamp_image with rotation -----------------------------------
+    // -- Tests: stamp_image full pipeline (property-based) -----------------
+    //
+    // End-to-end check: build a PDF, run stamp_image, extract the cm that
+    // the stamping code emitted into the Form XObject, and verify the same
+    // post-rotation corner property as the unit tests above. This catches
+    // any regression in either image_cm_for_rotation or how stamp_image
+    // wires it into the Form XObject content stream.
+
+    fn cm_vec_to_array(v: &[f32]) -> [f32; 6] {
+        [v[0], v[1], v[2], v[3], v[4], v[5]]
+    }
 
     #[test]
-    fn stamp_image_no_rotation_cm() {
+    fn stamp_image_lands_at_display_no_rotation() {
         let pdf = make_test_pdf(612.0, 792.0, None);
         let img = make_red_png();
         let stamped = stamp_image(&pdf, &img, 100.0, 200.0, 50.0, 60.0).unwrap();
-        let cm = extract_cm_from_stamped(&stamped);
-        assert_eq!(cm, vec![50.0, 0.0, 0.0, -60.0, 100.0, 260.0]);
+        let cm = cm_vec_to_array(&extract_cm_from_stamped(&stamped));
+        assert_stamp_corners_at_display(0, cm, 100.0, 200.0, 50.0, 60.0, 612.0, 792.0);
     }
 
     #[test]
-    fn stamp_image_rotation_90_cm() {
+    fn stamp_image_lands_at_display_rotation_90() {
         let pdf = make_test_pdf(612.0, 792.0, Some(90));
         let img = make_red_png();
-        // Position in effective (display) coords — effective page is 792 x 612
         let stamped = stamp_image(&pdf, &img, 100.0, 200.0, 50.0, 60.0).unwrap();
-        let cm = extract_cm_from_stamped(&stamped);
-        assert_eq!(cm, vec![0.0, -50.0, -60.0, 0.0, 260.0, 692.0]);
+        let cm = cm_vec_to_array(&extract_cm_from_stamped(&stamped));
+        assert_stamp_corners_at_display(90, cm, 100.0, 200.0, 50.0, 60.0, 612.0, 792.0);
     }
 
     #[test]
-    fn stamp_image_rotation_180_cm() {
+    fn stamp_image_lands_at_display_rotation_180() {
         let pdf = make_test_pdf(612.0, 792.0, Some(180));
         let img = make_red_png();
         let stamped = stamp_image(&pdf, &img, 100.0, 200.0, 50.0, 60.0).unwrap();
-        let cm = extract_cm_from_stamped(&stamped);
-        assert_eq!(cm, vec![-50.0, 0.0, 0.0, 60.0, 512.0, 532.0]);
+        let cm = cm_vec_to_array(&extract_cm_from_stamped(&stamped));
+        assert_stamp_corners_at_display(180, cm, 100.0, 200.0, 50.0, 60.0, 612.0, 792.0);
     }
 
     #[test]
-    fn stamp_image_rotation_270_cm() {
+    fn stamp_image_lands_at_display_rotation_270() {
         let pdf = make_test_pdf(612.0, 792.0, Some(270));
         let img = make_red_png();
         let stamped = stamp_image(&pdf, &img, 100.0, 200.0, 50.0, 60.0).unwrap();
-        let cm = extract_cm_from_stamped(&stamped);
-        assert_eq!(cm, vec![0.0, 50.0, 60.0, 0.0, 352.0, 100.0]);
+        let cm = cm_vec_to_array(&extract_cm_from_stamped(&stamped));
+        assert_stamp_corners_at_display(270, cm, 100.0, 200.0, 50.0, 60.0, 612.0, 792.0);
     }
 
     // -- Tests: stamp_text --------------------------------------------------
