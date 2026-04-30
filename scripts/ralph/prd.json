@@ -112,8 +112,8 @@
         "Manual verify recipe in commit body."
       ],
       "priority": 7,
-      "passes": false,
-      "notes": "Depends on US-P1. The 'first edit writes default, subsequent edits write override' rule is the trickiest UX bit; document it clearly."
+      "passes": true,
+      "notes": "New store action applyEdit(pdfId, partial) is the single enforcement point for the bootstrap rule: the first call (hasBootstrappedDefault=false) writes defaultConfig and flips the flag; every subsequent call writes overrides[pdfId]. UI components call applyEdit (never setDefault) for position/size/rotation. Image/text/color/font/lockAspect remain on default via existing shims (US-P3 may need to revisit if it adds per-PDF text edits). All component reads now go through getEffectiveConfig(currentPdfId), where currentPdfId = files[selectedIndex]?.path ?? ''. Document the bootstrap rule lives in progress.txt 'Codebase Patterns' (CLAUDE.md edit was rejected — patterns section in progress.txt is the canonical source for cross-iteration rules)."
     },
     {
       "id": "US-P3",
