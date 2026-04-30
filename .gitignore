@@ -6,3 +6,13 @@ src-tauri/libs/
 testing_files/
 *.tgz
 .DS_Store
+
+# iOS screenshots / photo dumps
+IMG_*.jpg
+IMG_*.JPG
+IMG_*.png
+IMG_*.PNG
+IMG_*.jpeg
+IMG_*.JPEG
+IMG_*.heic
+IMG_*.HEIC
