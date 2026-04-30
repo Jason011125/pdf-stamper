@@ -37,6 +37,29 @@ export async function selectOutputDir(): Promise<string | null> {
   return typeof selected === 'string' ? selected : null;
 }
 
+export interface ConflictInput {
+  path: string;
+}
+
+export interface Conflict {
+  idx: number;
+  output_path: string;
+}
+
+export type ConflictDecision = 'overwrite' | 'skip';
+
+export async function checkOutputConflicts(
+  inputs: ConflictInput[],
+  outputDir: string,
+  suffix: string,
+): Promise<Conflict[]> {
+  return invoke<Conflict[]>('check_output_conflicts', {
+    inputs,
+    outputDir,
+    suffix,
+  });
+}
+
 export interface StampParams {
   paths: string[];
   stampType: 'image' | 'text';
@@ -50,6 +73,7 @@ export interface StampParams {
   width: number;
   height: number;
   outputDir: string;
+  skipIndices?: number[];
 }
 
 export async function stampAllPdfs(params: StampParams): Promise<string[]> {
@@ -66,5 +90,6 @@ export async function stampAllPdfs(params: StampParams): Promise<string[]> {
     width: params.width,
     height: params.height,
     outputDir: params.outputDir,
+    skipIndices: params.skipIndices,
   });
 }

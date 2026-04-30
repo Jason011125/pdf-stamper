@@ -56,3 +56,17 @@ Environment: Linux devcontainer (.devcontainer/)
   - To extract testable batch-loop code from a Tauri command, accept a `FnMut(idx, &[u8]) -> Result<Vec<u8>, PdfError>` closure. Tests pass a no-op stamp_fn that just appends a marker, which avoids loading pdfium for skip-list assertions.
   - No `tempfile` crate in this repo. For tempdir-based tests, used a manual `make_tempdir(label)` helper that builds a unique dir under `std::env::temp_dir()` keyed by pid + nanos. Cheap, no new deps.
 ---
+
+## 2026-04-30 — US-002b
+- Added frontend bridge wrappers for the conflict-resolution flow:
+  - `checkOutputConflicts(inputs, outputDir, suffix)` calls the Rust `check_output_conflicts` Tauri command and returns `Conflict[]` (`{ idx, output_path }`).
+  - New exported types: `Conflict`, `ConflictInput`, `ConflictDecision = 'overwrite' | 'skip'`.
+  - `StampParams` gained optional `skipIndices?: number[]`; `stampAllPdfs` forwards it to `stamp_pdfs`.
+- Added `src/services/pdf-bridge.test.ts` covering arg-forwarding (camelCase keys for outputDir/skipIndices, response shape with snake_case output_path) by mocking `@tauri-apps/api/core`'s `invoke`.
+- Files changed: `src/services/pdf-bridge.ts`, `src/services/pdf-bridge.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- **Learnings**:
+  - Vitest mocking pattern for the Tauri core API in this repo: `vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }))` at the top of the test file (hoisted), then `const invokeMock = vi.mocked(invoke)` after import. Reset per test with `invokeMock.mockReset()` in `beforeEach`. Same pattern will work for `@tauri-apps/plugin-dialog` (`open`).
+  - Vitest config (`vite.config.ts`) auto-includes `src/**/*.{test,spec}.{ts,tsx}`, so co-locating `*.test.ts` next to the module under test (`src/services/pdf-bridge.test.ts`) just works — no extra wiring needed.
+  - When a TS field is `optional?: T`, passing it through to `invoke({ ...rest, key: params.key })` results in `key: undefined` on the args object. JSON.stringify drops `undefined`-valued keys, so Rust receives the field as absent — which deserializes to `Option::None`. No need to conditionally spread the field. The test asserts this with `args?.skipIndices === undefined` when callers omit it.
+  - Convention reaffirmed: response struct fields stay snake_case in TS to match the Rust `Serialize` default (no `rename_all = "camelCase"`). PdfInfo set the precedent; ConflictEntry follows it. Going camelCase here would have desynced from the Rust side (which already shipped in US-002a) and required a Rust-side rename.
+---

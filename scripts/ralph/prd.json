@@ -29,8 +29,8 @@
         "Vitest test for the bridge that mocks @tauri-apps/api invoke and asserts checkOutputConflicts forwards args correctly and parses the response shape."
       ],
       "priority": 2,
-      "passes": false,
-      "notes": "Depends on US-002a's Rust command being merged."
+      "passes": true,
+      "notes": "Bridge exports: checkOutputConflicts, Conflict, ConflictInput, ConflictDecision. Conflict.output_path is snake_case (matches Rust Serialize default + PdfInfo convention). stampAllPdfs accepts optional skipIndices?: number[]; when undefined, Tauri/JSON drops the key and Rust deserializes as None."
     },
     {
       "id": "US-002c",
