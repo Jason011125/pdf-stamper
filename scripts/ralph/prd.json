@@ -97,8 +97,8 @@
         "This story does NOT yet wire the new shape into UI components — that's US-P2. Existing components may need a tiny shim (e.g., calling getEffectiveConfig with a fixed id) to keep compiling. Acceptable."
       ],
       "priority": 6,
-      "passes": false,
-      "notes": "Pure store refactor + invariant tests."
+      "passes": true,
+      "notes": "stamp-store now exports StampConfig + DEFAULT_STAMP_CONFIG. Store shape: { defaultConfig, overrides, isPlaced, isExporting, exportProgress } + new actions (setDefault, setOverride, clearOverride) + selector getEffectiveConfig(pdfId). All existing setters (setPosition, setSize, setRotationDeg, setColor, ...) kept as backcompat shims that write to default — US-P2 will replace UI call sites with setOverride(currentPdfId, ...). rotationDeg normalization is centralized in normalizePartial() so both setDefault and setOverride apply it. Components currently read via useStampStore(s => s.defaultConfig.X) — US-P2 will swap that to s.getEffectiveConfig(currentPdfId).X."
     },
     {
       "id": "US-P2",

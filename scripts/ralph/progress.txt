@@ -117,3 +117,23 @@ Environment: Linux devcontainer (.devcontainer/)
   - Tauri arg-name camelCase auto-conversion holds for f32 too: Rust `rotation_deg: Option<f32>` ↔ TS `rotationDeg?: number`. No `#[serde(rename)]` needed; this matches the prior `skip_indices ↔ skipIndices` precedent from US-002a/b.
 ---
 
+## 2026-04-30 — US-P1
+- Refactored `src/stores/stamp-store.ts` from a single flat config to model A:
+  - New exported types: `StampConfig` (the configurable fields) and `DEFAULT_STAMP_CONFIG`.
+  - Store shape: `{ defaultConfig, overrides: Record<pdfId, Partial<StampConfig>>, isPlaced, isExporting, exportProgress }` plus actions and selector.
+  - New actions: `setDefault(partial)`, `setOverride(pdfId, partial)` (shallow-merges into the existing entry), `clearOverride(pdfId)` (drops the entry).
+  - New selector: `getEffectiveConfig(pdfId)` returns `{ ...defaultConfig, ...overrides[pdfId] }` (returns a fresh object, not the underlying default).
+  - Backcompat shim: every old setter (`setType`, `setImage`, `clearImage`, `setText`, `setFontFamily`, `setFontSize`, `setColor`, `setPosition`, `setSize`, `setLockAspect`, `setLockedAspect`, `setRotationDeg`) is preserved and writes to defaultConfig via `setDefault({...})`. US-P2 will replace UI call sites with `setOverride(currentPdfId, ...)`.
+  - rotationDeg normalization centralized in `normalizePartial()` so both `setDefault` and `setOverride` apply `((deg % 360) + 360) % 360` (NaN/Infinity → 0). Setting it via the shim still produces a normalized result.
+- Component shim (read side): replaced `s.xPt`/`s.color`/etc. selectors with `s.defaultConfig.xPt`/`s.defaultConfig.color`/... in `preview-pane.tsx` and `stamp-controls.tsx`. Operational state (`isPlaced`, `isExporting`, `exportProgress`) and shim setters keep their old top-level paths. US-P2 will swap reads to `s.getEffectiveConfig(currentPdfId).X`.
+- Tests: extended `src/stores/stamp-store.test.ts` from 6 → 16 tests. The original rotationDeg block was rewritten against the new shape (read via `defaultConfig.rotationDeg`), one new case asserts `setOverride` also normalizes rotationDeg, and a new `model A` describe block covers all 5 invariants from the AC plus shallow-merge / no-op-clear / fresh-object guarantees.
+- 42 vitest tests pass; `npx tsc --noEmit` clean. No Rust changes.
+- Files changed: `src/stores/stamp-store.ts`, `src/stores/stamp-store.test.ts`, `src/components/stamp-controls.tsx`, `src/components/preview-pane.tsx`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- **Learnings**:
+  - **The "tiny shim" the AC mentions splits cleanly into reads vs writes.** Reads change because the field path moves (`s.xPt` → `s.defaultConfig.xPt`); writes can stay as old setter names if those setters are reimplemented as one-liners that call `setDefault({...})`. Doing both keeps the diff for components mechanical and tiny while still letting the next story (US-P2) replace the calls one at a time without dragging unrelated UI behavior into this commit.
+  - **Centralize rotationDeg normalization in a `normalizePartial(partial)` helper, not per-action.** It runs from both `setDefault` and `setOverride`, AND from the `setRotationDeg` shim that delegates to `setDefault`. Putting normalization on the leaf (`setRotationDeg`) instead would have left a hole when US-P2 calls `setOverride(pdfId, { rotationDeg: -30 })` directly. The dedicated test `'normalizes rotationDeg passed via setOverride too'` is the trip-wire.
+  - **`getEffectiveConfig` must return a copy, not the live `defaultConfig` reference.** Otherwise downstream code mutating the result would corrupt the store's default. The test `'getEffectiveConfig returns a fresh object'` enforces this; the implementation does `{ ...defaultConfig, ...override }` (or `{ ...defaultConfig }` when no override exists) which guarantees a fresh top-level object every call.
+  - **`clearOverride` no-op short-circuit.** When `pdfId` is not in `overrides`, return `state` unchanged so React/Zustand selectors don't re-render. The test `'clearOverride is a no-op when the pdfId has no override'` documents the expectation, but the more important consequence is that the store doesn't churn its `overrides` object on calls to non-existent keys.
+  - **Per-PDF imagePreviewUrl is a footgun the type allows but the UI must avoid.** `StampConfig` includes `imagePreviewUrl` for type symmetry, so technically `setOverride(pdfId, { imagePreviewUrl: ... })` is legal. In practice nothing should ever do that — overrides should only ever carry position/size/rotation (per US-P2). If a future change starts copying image URLs into overrides we'd leak/double-revoke blob URLs in `clearImage`. Keep this in mind when wiring US-P2's setOverride call sites.
+---
+

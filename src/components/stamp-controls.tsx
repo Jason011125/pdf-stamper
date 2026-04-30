@@ -35,35 +35,38 @@ const DEFAULT_STAMP_LONG_SIDE = 100;
 export function StampControls(): React.JSX.Element {
   const files = usePdfStore((s) => s.files);
 
-  const stampType = useStampStore((s) => s.type);
+  // US-P1 shim: read config fields from defaultConfig until US-P2 wires
+  // getEffectiveConfig(currentPdfId) here. Setter shims (setType, setImage,
+  // setSize, ...) still write to default for now.
+  const stampType = useStampStore((s) => s.defaultConfig.type);
   const setType = useStampStore((s) => s.setType);
-  const imagePreviewUrl = useStampStore((s) => s.imagePreviewUrl);
-  const imagePath = useStampStore((s) => s.imagePath);
+  const imagePreviewUrl = useStampStore((s) => s.defaultConfig.imagePreviewUrl);
+  const imagePath = useStampStore((s) => s.defaultConfig.imagePath);
   const setImage = useStampStore((s) => s.setImage);
   const clearImage = useStampStore((s) => s.clearImage);
-  const text = useStampStore((s) => s.text);
+  const text = useStampStore((s) => s.defaultConfig.text);
   const setText = useStampStore((s) => s.setText);
-  const fontSize = useStampStore((s) => s.fontSize);
+  const fontSize = useStampStore((s) => s.defaultConfig.fontSize);
   const setFontSize = useStampStore((s) => s.setFontSize);
-  const color = useStampStore((s) => s.color);
+  const color = useStampStore((s) => s.defaultConfig.color);
   const setColor = useStampStore((s) => s.setColor);
-  const widthPt = useStampStore((s) => s.widthPt);
-  const heightPt = useStampStore((s) => s.heightPt);
+  const widthPt = useStampStore((s) => s.defaultConfig.widthPt);
+  const heightPt = useStampStore((s) => s.defaultConfig.heightPt);
   const setSize = useStampStore((s) => s.setSize);
-  const lockAspect = useStampStore((s) => s.lockAspect);
+  const lockAspect = useStampStore((s) => s.defaultConfig.lockAspect);
   const setLockAspect = useStampStore((s) => s.setLockAspect);
-  const lockedAspect = useStampStore((s) => s.lockedAspect);
+  const lockedAspect = useStampStore((s) => s.defaultConfig.lockedAspect);
   const setLockedAspect = useStampStore((s) => s.setLockedAspect);
-  const xPt = useStampStore((s) => s.xPt);
-  const yPt = useStampStore((s) => s.yPt);
-  const rotationDeg = useStampStore((s) => s.rotationDeg);
+  const xPt = useStampStore((s) => s.defaultConfig.xPt);
+  const yPt = useStampStore((s) => s.defaultConfig.yPt);
+  const rotationDeg = useStampStore((s) => s.defaultConfig.rotationDeg);
   const setRotationDeg = useStampStore((s) => s.setRotationDeg);
   const isPlaced = useStampStore((s) => s.isPlaced);
   const isExporting = useStampStore((s) => s.isExporting);
   const setExporting = useStampStore((s) => s.setExporting);
   const exportProgress = useStampStore((s) => s.exportProgress);
   const setExportProgress = useStampStore((s) => s.setExportProgress);
-  const fontName = useStampStore((s) => s.fontFamily);
+  const fontName = useStampStore((s) => s.defaultConfig.fontFamily);
 
   const handleImageUpload = useCallback(async () => {
     const selected = await open({

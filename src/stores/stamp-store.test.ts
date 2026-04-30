@@ -1,52 +1,162 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { useStampStore } from './stamp-store';
+import {
+  useStampStore,
+  DEFAULT_STAMP_CONFIG,
+  type StampConfig,
+} from './stamp-store';
 
 function reset(): void {
-  useStampStore.setState({ rotationDeg: 0 });
+  useStampStore.setState({
+    defaultConfig: { ...DEFAULT_STAMP_CONFIG },
+    overrides: {},
+  });
 }
 
-describe('stamp-store rotationDeg', () => {
+describe('stamp-store rotationDeg (via setRotationDeg shim → setDefault)', () => {
   beforeEach(reset);
 
   it('defaults to 0', () => {
-    expect(useStampStore.getState().rotationDeg).toBe(0);
+    expect(useStampStore.getState().defaultConfig.rotationDeg).toBe(0);
   });
 
   it('stores values within [0, 360) unchanged', () => {
     const { setRotationDeg } = useStampStore.getState();
     setRotationDeg(45);
-    expect(useStampStore.getState().rotationDeg).toBe(45);
+    expect(useStampStore.getState().defaultConfig.rotationDeg).toBe(45);
     setRotationDeg(0);
-    expect(useStampStore.getState().rotationDeg).toBe(0);
+    expect(useStampStore.getState().defaultConfig.rotationDeg).toBe(0);
     setRotationDeg(359.5);
-    expect(useStampStore.getState().rotationDeg).toBe(359.5);
+    expect(useStampStore.getState().defaultConfig.rotationDeg).toBe(359.5);
   });
 
   it('normalizes 360 to 0', () => {
     useStampStore.getState().setRotationDeg(360);
-    expect(useStampStore.getState().rotationDeg).toBe(0);
+    expect(useStampStore.getState().defaultConfig.rotationDeg).toBe(0);
   });
 
   it('wraps values >= 360 into [0, 360)', () => {
     useStampStore.getState().setRotationDeg(450);
-    expect(useStampStore.getState().rotationDeg).toBe(90);
+    expect(useStampStore.getState().defaultConfig.rotationDeg).toBe(90);
     useStampStore.getState().setRotationDeg(720);
-    expect(useStampStore.getState().rotationDeg).toBe(0);
+    expect(useStampStore.getState().defaultConfig.rotationDeg).toBe(0);
   });
 
   it('wraps negative values into [0, 360)', () => {
     useStampStore.getState().setRotationDeg(-30);
-    expect(useStampStore.getState().rotationDeg).toBe(330);
+    expect(useStampStore.getState().defaultConfig.rotationDeg).toBe(330);
     useStampStore.getState().setRotationDeg(-90);
-    expect(useStampStore.getState().rotationDeg).toBe(270);
+    expect(useStampStore.getState().defaultConfig.rotationDeg).toBe(270);
     useStampStore.getState().setRotationDeg(-360);
-    expect(useStampStore.getState().rotationDeg).toBe(0);
+    expect(useStampStore.getState().defaultConfig.rotationDeg).toBe(0);
   });
 
   it('falls back to 0 on NaN/Infinity', () => {
     useStampStore.getState().setRotationDeg(Number.NaN);
-    expect(useStampStore.getState().rotationDeg).toBe(0);
+    expect(useStampStore.getState().defaultConfig.rotationDeg).toBe(0);
     useStampStore.getState().setRotationDeg(Number.POSITIVE_INFINITY);
-    expect(useStampStore.getState().rotationDeg).toBe(0);
+    expect(useStampStore.getState().defaultConfig.rotationDeg).toBe(0);
+  });
+
+  it('normalizes rotationDeg passed via setOverride too', () => {
+    useStampStore.getState().setOverride('p1', { rotationDeg: -45 });
+    expect(useStampStore.getState().getEffectiveConfig('p1').rotationDeg).toBe(315);
+    useStampStore.getState().setOverride('p1', { rotationDeg: Number.NaN });
+    expect(useStampStore.getState().getEffectiveConfig('p1').rotationDeg).toBe(0);
+  });
+});
+
+describe('stamp-store model A — defaultConfig + per-PDF overrides', () => {
+  beforeEach(reset);
+
+  // Invariant 1: default exists from start
+  it('starts with defaultConfig populated and overrides empty', () => {
+    const state = useStampStore.getState();
+    expect(state.defaultConfig).toEqual(DEFAULT_STAMP_CONFIG);
+    expect(state.overrides).toEqual({});
+    expect(state.getEffectiveConfig('any-pdf')).toEqual(DEFAULT_STAMP_CONFIG);
+  });
+
+  // Invariant 2: override never modifies default
+  it('setOverride leaves defaultConfig untouched', () => {
+    const before: StampConfig = { ...useStampStore.getState().defaultConfig };
+    useStampStore.getState().setOverride('p1', { xPt: 200, yPt: 150 });
+    expect(useStampStore.getState().defaultConfig).toEqual(before);
+    expect(useStampStore.getState().getEffectiveConfig('p1')).toMatchObject({
+      ...before,
+      xPt: 200,
+      yPt: 150,
+    });
+  });
+
+  // Invariant 3: changing default affects all PDFs without an override
+  it('setDefault flows through to every PDF that has no override', () => {
+    useStampStore.getState().setOverride('p2', { xPt: 999 });
+    useStampStore.getState().setDefault({ color: '#00ff00', widthPt: 250 });
+
+    const eff0 = useStampStore.getState().getEffectiveConfig('p0');
+    const eff1 = useStampStore.getState().getEffectiveConfig('p1');
+    const eff2 = useStampStore.getState().getEffectiveConfig('p2');
+
+    expect(eff0.color).toBe('#00ff00');
+    expect(eff0.widthPt).toBe(250);
+    expect(eff1.color).toBe('#00ff00');
+    expect(eff1.widthPt).toBe(250);
+    expect(eff2.color).toBe('#00ff00');
+    expect(eff2.widthPt).toBe(250);
+  });
+
+  // Invariant 4: PDF with override stays put when default changes
+  it('overridden fields are not touched by setDefault', () => {
+    useStampStore.getState().setOverride('p1', { xPt: 500, yPt: 400 });
+    useStampStore.getState().setDefault({ xPt: 10, yPt: 20, color: '#0000ff' });
+
+    const eff = useStampStore.getState().getEffectiveConfig('p1');
+    expect(eff.xPt).toBe(500); // override wins
+    expect(eff.yPt).toBe(400); // override wins
+    expect(eff.color).toBe('#0000ff'); // not overridden → falls through
+  });
+
+  // Invariant 5: clearing override returns that PDF to default
+  it('clearOverride drops the entry and the PDF reverts to default', () => {
+    useStampStore.getState().setOverride('p1', { xPt: 500 });
+    expect(useStampStore.getState().getEffectiveConfig('p1').xPt).toBe(500);
+
+    useStampStore.getState().clearOverride('p1');
+    expect(useStampStore.getState().overrides['p1']).toBeUndefined();
+    expect(useStampStore.getState().getEffectiveConfig('p1')).toEqual(
+      DEFAULT_STAMP_CONFIG,
+    );
+  });
+
+  it('setOverride shallow-merges into existing override entry', () => {
+    useStampStore.getState().setOverride('p1', { xPt: 100, yPt: 50 });
+    useStampStore.getState().setOverride('p1', { yPt: 75 });
+
+    expect(useStampStore.getState().overrides['p1']).toEqual({
+      xPt: 100,
+      yPt: 75,
+    });
+    const eff = useStampStore.getState().getEffectiveConfig('p1');
+    expect(eff.xPt).toBe(100);
+    expect(eff.yPt).toBe(75);
+  });
+
+  it('setDefault shallow-merges (does not replace untouched fields)', () => {
+    const before = useStampStore.getState().defaultConfig.color;
+    useStampStore.getState().setDefault({ xPt: 17 });
+    expect(useStampStore.getState().defaultConfig.xPt).toBe(17);
+    expect(useStampStore.getState().defaultConfig.color).toBe(before);
+  });
+
+  it('clearOverride is a no-op when the pdfId has no override', () => {
+    useStampStore.getState().clearOverride('never-overridden');
+    expect(useStampStore.getState().overrides).toEqual({});
+  });
+
+  it('getEffectiveConfig returns a fresh object (not the underlying default)', () => {
+    const a = useStampStore.getState().getEffectiveConfig('p0');
+    const b = useStampStore.getState().getEffectiveConfig('p0');
+    expect(a).toEqual(b);
+    expect(a).not.toBe(useStampStore.getState().defaultConfig);
   });
 });

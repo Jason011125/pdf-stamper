@@ -29,16 +29,18 @@ export function PreviewPane(): React.JSX.Element {
   const selectedIndex = usePdfStore((s) => s.selectedIndex);
   const file = files[selectedIndex];
 
-  const stampType = useStampStore((s) => s.type);
-  const imagePreviewUrl = useStampStore((s) => s.imagePreviewUrl);
-  const text = useStampStore((s) => s.text);
-  const fontSize = useStampStore((s) => s.fontSize);
-  const color = useStampStore((s) => s.color);
-  const xPt = useStampStore((s) => s.xPt);
-  const yPt = useStampStore((s) => s.yPt);
-  const widthPt = useStampStore((s) => s.widthPt);
-  const heightPt = useStampStore((s) => s.heightPt);
-  const rotationDeg = useStampStore((s) => s.rotationDeg);
+  // US-P1 shim: read from defaultConfig until US-P2 wires
+  // getEffectiveConfig(currentPdfId) here.
+  const stampType = useStampStore((s) => s.defaultConfig.type);
+  const imagePreviewUrl = useStampStore((s) => s.defaultConfig.imagePreviewUrl);
+  const text = useStampStore((s) => s.defaultConfig.text);
+  const fontSize = useStampStore((s) => s.defaultConfig.fontSize);
+  const color = useStampStore((s) => s.defaultConfig.color);
+  const xPt = useStampStore((s) => s.defaultConfig.xPt);
+  const yPt = useStampStore((s) => s.defaultConfig.yPt);
+  const widthPt = useStampStore((s) => s.defaultConfig.widthPt);
+  const heightPt = useStampStore((s) => s.defaultConfig.heightPt);
+  const rotationDeg = useStampStore((s) => s.defaultConfig.rotationDeg);
   const isPlaced = useStampStore((s) => s.isPlaced);
   const setPosition = useStampStore((s) => s.setPosition);
   const setPlaced = useStampStore((s) => s.setPlaced);
