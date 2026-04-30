@@ -28,21 +28,27 @@ export function PreviewPane(): React.JSX.Element {
   const files = usePdfStore((s) => s.files);
   const selectedIndex = usePdfStore((s) => s.selectedIndex);
   const file = files[selectedIndex];
+  const currentPdfId = file?.path ?? '';
 
-  // US-P1 shim: read from defaultConfig until US-P2 wires
-  // getEffectiveConfig(currentPdfId) here.
-  const stampType = useStampStore((s) => s.defaultConfig.type);
-  const imagePreviewUrl = useStampStore((s) => s.defaultConfig.imagePreviewUrl);
-  const text = useStampStore((s) => s.defaultConfig.text);
-  const fontSize = useStampStore((s) => s.defaultConfig.fontSize);
-  const color = useStampStore((s) => s.defaultConfig.color);
-  const xPt = useStampStore((s) => s.defaultConfig.xPt);
-  const yPt = useStampStore((s) => s.defaultConfig.yPt);
-  const widthPt = useStampStore((s) => s.defaultConfig.widthPt);
-  const heightPt = useStampStore((s) => s.defaultConfig.heightPt);
-  const rotationDeg = useStampStore((s) => s.defaultConfig.rotationDeg);
+  // Reads go through getEffectiveConfig(currentPdfId): the selector returns a
+  // fresh object on every state change, but we pluck primitive fields out, so
+  // Zustand's default Object.is equality avoids spurious re-renders.
+  const stampType = useStampStore((s) => s.getEffectiveConfig(currentPdfId).type);
+  const imagePreviewUrl = useStampStore(
+    (s) => s.getEffectiveConfig(currentPdfId).imagePreviewUrl,
+  );
+  const text = useStampStore((s) => s.getEffectiveConfig(currentPdfId).text);
+  const fontSize = useStampStore((s) => s.getEffectiveConfig(currentPdfId).fontSize);
+  const color = useStampStore((s) => s.getEffectiveConfig(currentPdfId).color);
+  const xPt = useStampStore((s) => s.getEffectiveConfig(currentPdfId).xPt);
+  const yPt = useStampStore((s) => s.getEffectiveConfig(currentPdfId).yPt);
+  const widthPt = useStampStore((s) => s.getEffectiveConfig(currentPdfId).widthPt);
+  const heightPt = useStampStore((s) => s.getEffectiveConfig(currentPdfId).heightPt);
+  const rotationDeg = useStampStore(
+    (s) => s.getEffectiveConfig(currentPdfId).rotationDeg,
+  );
   const isPlaced = useStampStore((s) => s.isPlaced);
-  const setPosition = useStampStore((s) => s.setPosition);
+  const applyEdit = useStampStore((s) => s.applyEdit);
   const setPlaced = useStampStore((s) => s.setPlaced);
 
   const containerRef = useRef<HTMLDivElement>(null);
@@ -131,10 +137,10 @@ export function PreviewPane(): React.JSX.Element {
       );
 
       const pdf = toPdfPos(topLeftX, topLeftY);
-      setPosition(pdf.x, pdf.y);
+      applyEdit(currentPdfId, { xPt: pdf.x, yPt: pdf.y });
       setPlaced(true);
     },
-    [file, imageSize, widthPt, heightPt, toPdfPos, setPosition, setPlaced],
+    [file, imageSize, widthPt, heightPt, toPdfPos, applyEdit, setPlaced, currentPdfId],
   );
 
   // Drag stamp to reposition
@@ -172,7 +178,7 @@ export function PreviewPane(): React.JSX.Element {
         const clampedY = Math.max(0, Math.min(newTop, imageSize.height - stampScreenSize.height));
 
         const pdf = toPdfPos(clampedX, clampedY);
-        setPosition(pdf.x, pdf.y);
+        applyEdit(currentPdfId, { xPt: pdf.x, yPt: pdf.y });
       };
 
       const handleUp = (): void => {
@@ -183,7 +189,7 @@ export function PreviewPane(): React.JSX.Element {
       window.addEventListener('mousemove', handleMove);
       window.addEventListener('mouseup', handleUp);
     },
-    [file, imageSize, widthPt, heightPt, toPdfPos, setPosition],
+    [file, imageSize, widthPt, heightPt, toPdfPos, applyEdit, currentPdfId],
   );
 
   if (!file) {

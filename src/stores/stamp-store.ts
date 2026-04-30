@@ -59,6 +59,12 @@ function normalizePartial(partial: Partial<StampConfig>): Partial<StampConfig> {
 interface StampStore {
   defaultConfig: StampConfig;
   overrides: Record<string, Partial<StampConfig>>;
+  /** True after the very first applyEdit call. The first edit is the
+   * "bootstrap" — it writes to defaultConfig (so every loaded PDF inherits
+   * it). Every subsequent applyEdit routes to overrides[pdfId] instead.
+   * UI components must use applyEdit (never setDefault) for position/size/
+   * rotation edits so this rule has exactly one enforcement point. */
+  hasBootstrappedDefault: boolean;
 
   isPlaced: boolean;
   isExporting: boolean;
@@ -71,6 +77,11 @@ interface StampStore {
   setDefault: (partial: Partial<StampConfig>) => void;
   setOverride: (pdfId: string, partial: Partial<StampConfig>) => void;
   clearOverride: (pdfId: string) => void;
+  /** Routes a position/size/rotation edit from the UI: the first call writes
+   * to defaultConfig (bootstrap; flips hasBootstrappedDefault), every later
+   * call writes to overrides[pdfId]. Keeps the bootstrap rule out of the
+   * components — they just call applyEdit(currentPdfId, partial). */
+  applyEdit: (pdfId: string, partial: Partial<StampConfig>) => void;
 
   setPlaced: (placed: boolean) => void;
   setExporting: (exporting: boolean) => void;
@@ -95,6 +106,7 @@ interface StampStore {
 export const useStampStore = create<StampStore>((set, get) => ({
   defaultConfig: { ...DEFAULT_STAMP_CONFIG },
   overrides: {},
+  hasBootstrappedDefault: false,
   isPlaced: false,
   isExporting: false,
   exportProgress: { current: 0, total: 0 },
@@ -127,6 +139,23 @@ export const useStampStore = create<StampStore>((set, get) => ({
       const next = { ...state.overrides };
       delete next[pdfId];
       return { overrides: next };
+    }),
+
+  applyEdit: (pdfId, partial) =>
+    set((state) => {
+      const normalized = normalizePartial(partial);
+      if (!state.hasBootstrappedDefault) {
+        return {
+          defaultConfig: { ...state.defaultConfig, ...normalized },
+          hasBootstrappedDefault: true,
+        };
+      }
+      return {
+        overrides: {
+          ...state.overrides,
+          [pdfId]: { ...(state.overrides[pdfId] ?? {}), ...normalized },
+        },
+      };
     }),
 
   setPlaced: (placed) => set({ isPlaced: placed }),
