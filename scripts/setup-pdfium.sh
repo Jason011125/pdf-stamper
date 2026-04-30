@@ -26,6 +26,10 @@ case "$(uname -s)-$(uname -m)" in
     asset="pdfium-linux-x64.tgz"
     lib_in_archive="lib/libpdfium.so"
     ;;
+  Linux-aarch64 | Linux-arm64)
+    asset="pdfium-linux-arm64.tgz"
+    lib_in_archive="lib/libpdfium.so"
+    ;;
   MINGW*-x86_64 | MSYS*-x86_64 | CYGWIN*-x86_64)
     asset="pdfium-win-x64.tgz"
     lib_in_archive="bin/pdfium.dll"
