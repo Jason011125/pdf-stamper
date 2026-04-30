@@ -68,5 +68,11 @@ sudo iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
 sudo iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT
 # The allowlist
 sudo iptables -A OUTPUT -m set --match-set allowed-domains dst -j ACCEPT
+# Trust the host's FAKEIP-mode proxy: any 198.18.0.0/15 destination is
+# already a vetted, proxy-routed domain on the host side. Without this,
+# domains the host proxy intercepts (claude.ai, statsig.anthropic.com,
+# console.anthropic.com, sentry.io, etc.) hit DROP because their FAKEIP
+# isn't in the resolved-at-init allowlist.
+sudo iptables -A OUTPUT -d 198.18.0.0/15 -j ACCEPT
 
 echo "firewall active; allowlist: ${ALLOWLIST[*]}"
