@@ -72,6 +72,8 @@ export interface StampParams {
   y: number;
   width: number;
   height: number;
+  /** Stamp rotation in degrees CCW around the stamp's center. */
+  rotationDeg?: number;
   outputDir: string;
   skipIndices?: number[];
 }
@@ -89,6 +91,7 @@ export async function stampAllPdfs(params: StampParams): Promise<string[]> {
     y: params.y,
     width: params.width,
     height: params.height,
+    rotationDeg: params.rotationDeg,
     outputDir: params.outputDir,
     skipIndices: params.skipIndices,
   });

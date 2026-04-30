@@ -387,6 +387,7 @@ pub fn stamp_image(
     y: f32,
     width: f32,
     height: f32,
+    user_angle_deg: f32,
 ) -> Result<Vec<u8>, PdfError> {
     let mut doc = Document::load_mem(pdf_bytes)
         .map_err(|e| PdfError::StampError(e.to_string()))?;
@@ -406,7 +407,7 @@ pub fn stamp_image(
     // correct position and orientation in the displayed (rotated) page.
     let img_ref_name = b"Img0";
     let [a, b, c, d, e, f] = image_cm_for_rotation(
-        geo.rotation, x, y, width, height, geo.raw_width, geo.raw_height, 0.0,
+        geo.rotation, x, y, width, height, geo.raw_width, geo.raw_height, user_angle_deg,
     );
     let form_ops = vec![
         Operation::new("q", vec![]),
@@ -1444,7 +1445,7 @@ mod tests {
     fn stamp_image_lands_at_display_no_rotation() {
         let pdf = make_test_pdf(612.0, 792.0, None);
         let img = make_red_png();
-        let stamped = stamp_image(&pdf, &img, 100.0, 200.0, 150.0, 75.0).unwrap();
+        let stamped = stamp_image(&pdf, &img, 100.0, 200.0, 150.0, 75.0, 0.0).unwrap();
         assert_stamp_renders_at_display(&stamped, 0, 612.0, 792.0, 100.0, 200.0, 150.0, 75.0);
     }
 
@@ -1452,7 +1453,7 @@ mod tests {
     fn stamp_image_lands_at_display_rotation_90() {
         let pdf = make_test_pdf(612.0, 792.0, Some(90));
         let img = make_red_png();
-        let stamped = stamp_image(&pdf, &img, 100.0, 200.0, 150.0, 75.0).unwrap();
+        let stamped = stamp_image(&pdf, &img, 100.0, 200.0, 150.0, 75.0, 0.0).unwrap();
         assert_stamp_renders_at_display(&stamped, 90, 612.0, 792.0, 100.0, 200.0, 150.0, 75.0);
     }
 
@@ -1460,7 +1461,7 @@ mod tests {
     fn stamp_image_lands_at_display_rotation_180() {
         let pdf = make_test_pdf(612.0, 792.0, Some(180));
         let img = make_red_png();
-        let stamped = stamp_image(&pdf, &img, 100.0, 200.0, 150.0, 75.0).unwrap();
+        let stamped = stamp_image(&pdf, &img, 100.0, 200.0, 150.0, 75.0, 0.0).unwrap();
         assert_stamp_renders_at_display(&stamped, 180, 612.0, 792.0, 100.0, 200.0, 150.0, 75.0);
     }
 
@@ -1468,7 +1469,7 @@ mod tests {
     fn stamp_image_lands_at_display_rotation_270() {
         let pdf = make_test_pdf(612.0, 792.0, Some(270));
         let img = make_red_png();
-        let stamped = stamp_image(&pdf, &img, 100.0, 200.0, 150.0, 75.0).unwrap();
+        let stamped = stamp_image(&pdf, &img, 100.0, 200.0, 150.0, 75.0, 0.0).unwrap();
         assert_stamp_renders_at_display(&stamped, 270, 612.0, 792.0, 100.0, 200.0, 150.0, 75.0);
     }
 
@@ -1477,7 +1478,7 @@ mod tests {
         // Non-square page: exercises matrices that only work for square pages.
         let pdf = make_test_pdf(1000.0, 400.0, Some(90));
         let img = make_red_png();
-        let stamped = stamp_image(&pdf, &img, 50.0, 30.0, 200.0, 80.0).unwrap();
+        let stamped = stamp_image(&pdf, &img, 50.0, 30.0, 200.0, 80.0, 0.0).unwrap();
         assert_stamp_renders_at_display(&stamped, 90, 1000.0, 400.0, 50.0, 30.0, 200.0, 80.0);
     }
 
@@ -1580,7 +1581,7 @@ mod tests {
     fn stamp_image_user_rotation_zero_landscape_unchanged() {
         let pdf = make_test_pdf(1000.0, 400.0, Some(270));
         let img = make_red_png();
-        let stamped = stamp_image(&pdf, &img, 50.0, 30.0, 200.0, 80.0).unwrap();
+        let stamped = stamp_image(&pdf, &img, 50.0, 30.0, 200.0, 80.0, 0.0).unwrap();
         assert_stamp_renders_at_display(&stamped, 270, 1000.0, 400.0, 50.0, 30.0, 200.0, 80.0);
     }
 
@@ -1723,7 +1724,7 @@ mod tests {
         let img = make_solid_red_png(50, 50);
 
         let (dx, dy, w, h) = (200.0_f32, 300.0_f32, 100.0_f32, 100.0_f32);
-        let stamped = stamp_image(&pdf, &img, dx, dy, w, h).unwrap();
+        let stamped = stamp_image(&pdf, &img, dx, dy, w, h, 0.0).unwrap();
 
         let target_w = 600u16;
         let ((rx_min, rx_max), (ry_min, ry_max)) = red_bbox_in_render(&stamped, target_w);
@@ -1834,7 +1835,7 @@ mod tests {
         eprintln!("  display position (bottom-left of stamp) = ({}, {})", dx, dy);
         eprintln!("  display size                            = {} x {}", w, h);
 
-        let stamped = stamp_image(&pdf_bytes, &img_bytes, dx, dy, w, h).unwrap();
+        let stamped = stamp_image(&pdf_bytes, &img_bytes, dx, dy, w, h, 0.0).unwrap();
         let out_pdf = "/tmp/stamped-diagnostic.pdf";
         std::fs::write(out_pdf, &stamped).unwrap();
         eprintln!("\nstamped PDF written to {} ({} bytes)", out_pdf, stamped.len());
@@ -1916,7 +1917,7 @@ mod tests {
     fn form_bbox_uses_raw_dimensions() {
         let pdf = make_test_pdf(612.0, 792.0, Some(90));
         let img = make_red_png();
-        let stamped = stamp_image(&pdf, &img, 100.0, 200.0, 50.0, 60.0).unwrap();
+        let stamped = stamp_image(&pdf, &img, 100.0, 200.0, 50.0, 60.0, 0.0).unwrap();
 
         let doc = Document::load_mem(&stamped).unwrap();
         let page_id = doc.page_iter().next().unwrap();

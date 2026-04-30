@@ -74,6 +74,7 @@ pub async fn stamp_pdfs(
     y: f32,
     width: f32,
     height: f32,
+    rotation_deg: Option<f32>,
     output_dir: String,
     skip_indices: Option<Vec<usize>>,
 ) -> Result<Vec<String>, String> {
@@ -87,6 +88,7 @@ pub async fn stamp_pdfs(
     let size = font_size.unwrap_or(24.0);
     let font = font_name.unwrap_or_else(|| "Helvetica".to_string());
     let rgb = color.as_deref().and_then(crate::pdf::parse_hex_color);
+    let rot = rotation_deg.unwrap_or(0.0);
 
     crate::pdf::stamp_paths_to_disk(
         &paths,
@@ -100,7 +102,7 @@ pub async fn stamp_pdfs(
                     .ok_or_else(|| crate::pdf::PdfError::StampError(
                         "No image data provided".into(),
                     ))?;
-                crate::pdf::stamp_image(pdf_bytes, img, x, y, width, height)
+                crate::pdf::stamp_image(pdf_bytes, img, x, y, width, height, rot)
             }
             "text" => crate::pdf::stamp_text(pdf_bytes, &txt, x, y, size, &font, rgb),
             other => Err(crate::pdf::PdfError::StampError(format!(

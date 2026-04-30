@@ -11,6 +11,19 @@ import { pdfSizeToScreen } from '../services/coordinate-utils';
  * Conversion to PDF points only happens at export time (in stamp-controls).
  */
 
+/** Build the inline style fragment for the stamp overlay's rotation.
+ * `rotationDeg` is CCW around the stamp center (PDF y-up math convention).
+ * CSS `rotate()` is CW because screen y is down, so we negate to keep the
+ * preview's visual orientation in sync with what the PDF export produces. */
+export function stampRotationStyle(
+  rotationDeg: number,
+): { transform: string; transformOrigin: string } {
+  return {
+    transform: `rotate(${-rotationDeg}deg)`,
+    transformOrigin: 'center',
+  };
+}
+
 export function PreviewPane(): React.JSX.Element {
   const files = usePdfStore((s) => s.files);
   const selectedIndex = usePdfStore((s) => s.selectedIndex);
@@ -25,6 +38,7 @@ export function PreviewPane(): React.JSX.Element {
   const yPt = useStampStore((s) => s.yPt);
   const widthPt = useStampStore((s) => s.widthPt);
   const heightPt = useStampStore((s) => s.heightPt);
+  const rotationDeg = useStampStore((s) => s.rotationDeg);
   const isPlaced = useStampStore((s) => s.isPlaced);
   const setPosition = useStampStore((s) => s.setPosition);
   const setPlaced = useStampStore((s) => s.setPlaced);
@@ -241,6 +255,7 @@ export function PreviewPane(): React.JSX.Element {
               top: screenPos.y,
               width: stampScreenSize.width,
               height: stampScreenSize.height,
+              ...stampRotationStyle(rotationDeg),
             }}
           >
             {stampType === 'image' && imagePreviewUrl && (

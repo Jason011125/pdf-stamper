@@ -79,8 +79,8 @@
         "Manual verify recipe in commit body: open 1 PDF, drag stamp, change rotation slider → live preview rotates; export → rendered PDF stamp matches the rotation."
       ],
       "priority": 5,
-      "passes": false,
-      "notes": "Depends on US-R1's Rust function."
+      "passes": true,
+      "notes": "Store: rotationDeg + setRotationDeg (normalized to [0, 360) via mod-then-add-mod, NaN→0). Preview: stampRotationStyle(rotationDeg) helper exported from preview-pane.tsx negates the angle for CSS (CCW user → CW screen). Bridge: optional rotationDeg in StampParams; absent = Rust None = 0.0. Rust: stamp_image now takes user_angle_deg as 7th arg; commands::stamp_pdfs accepts optional rotation_deg (camelCase rotationDeg over IPC). All 9 stamp_image test call sites pass 0.0 for the new arg."
     },
     {
       "id": "US-P1",

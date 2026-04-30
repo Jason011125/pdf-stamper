@@ -56,6 +56,8 @@ export function StampControls(): React.JSX.Element {
   const setLockedAspect = useStampStore((s) => s.setLockedAspect);
   const xPt = useStampStore((s) => s.xPt);
   const yPt = useStampStore((s) => s.yPt);
+  const rotationDeg = useStampStore((s) => s.rotationDeg);
+  const setRotationDeg = useStampStore((s) => s.setRotationDeg);
   const isPlaced = useStampStore((s) => s.isPlaced);
   const isExporting = useStampStore((s) => s.isExporting);
   const setExporting = useStampStore((s) => s.setExporting);
@@ -163,6 +165,7 @@ export function StampControls(): React.JSX.Element {
           y: yPt,
           width: widthPt,
           height: heightPt,
+          rotationDeg,
           outputDir,
           skipIndices: skipIndices.length > 0 ? skipIndices : undefined,
         });
@@ -176,7 +179,7 @@ export function StampControls(): React.JSX.Element {
     },
     [
       files, stampType, imagePath, text, fontSize, fontName, color,
-      xPt, yPt, widthPt, heightPt, setExporting, setExportProgress,
+      xPt, yPt, widthPt, heightPt, rotationDeg, setExporting, setExportProgress,
     ],
   );
 
@@ -329,6 +332,42 @@ export function StampControls(): React.JSX.Element {
             min={10}
             className="w-20 rounded-md border border-gray-300 px-2 py-1 text-sm"
             placeholder="H"
+          />
+        </div>
+      </div>
+
+      {/* Rotation */}
+      <div className="space-y-1">
+        <div className="flex items-center justify-between">
+          <span className="text-xs text-gray-500">Rotation (deg, CCW)</span>
+          <button
+            type="button"
+            onClick={() => setRotationDeg(0)}
+            className="text-xs text-blue-500 hover:underline"
+          >
+            Reset
+          </button>
+        </div>
+        <div className="flex items-center gap-2">
+          <input
+            type="range"
+            min={0}
+            max={360}
+            step={1}
+            value={rotationDeg}
+            onChange={(e) => setRotationDeg(Number(e.target.value))}
+            className="flex-1"
+            aria-label="Stamp rotation slider"
+          />
+          <input
+            type="number"
+            min={0}
+            max={360}
+            step={1}
+            value={Math.round(rotationDeg)}
+            onChange={(e) => setRotationDeg(Number(e.target.value))}
+            className="w-16 rounded-md border border-gray-300 px-2 py-1 text-sm"
+            aria-label="Stamp rotation degrees"
           />
         </div>
       </div>

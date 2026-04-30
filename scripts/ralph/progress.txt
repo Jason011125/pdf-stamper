@@ -97,3 +97,23 @@ Environment: Linux devcontainer (.devcontainer/)
   - Two related but separate sign conventions live in the same file now: PDF's `/Rotate` is CW (raw → display), but user rotation is CCW (industry convention for "rotate this image"). The `affine_rotate_deg` doc comment + the `image_cm_for_rotation` doc comment both call out CCW explicitly; future code that mixes the two should preserve that distinction in names (`*_deg_ccw`?) if it gets confusing.
 ---
 
+## 2026-04-30 — US-R2
+- Frontend: added `rotationDeg` + `setRotationDeg` to `stamp-store.ts`. Setter normalizes to `[0, 360)` via `((deg % 360) + 360) % 360`; falls back to 0 on NaN/Infinity.
+- `stamp-controls.tsx`: new "Rotation (deg, CCW)" block with a 0–360 slider, a synced number input, and a Reset button. Threaded `rotationDeg` into the `runStamp` callback's `stampAllPdfs` payload.
+- `preview-pane.tsx`: extracted pure helper `stampRotationStyle(rotationDeg)` (exported) producing `{ transform: 'rotate(${-rotationDeg}deg)', transformOrigin: 'center' }`. Applied to the stamp overlay's inline style.
+- `pdf-bridge.ts`: `StampParams` gained optional `rotationDeg?: number`; `stampAllPdfs` forwards it under the `rotationDeg` IPC key (omitted = `undefined` = Rust `None` → `0.0`).
+- `commands.rs`: `stamp_pdfs` accepts `rotation_deg: Option<f32>`, passes it to `pdf::stamp_image`. `pdf::stamp_image` signature gained `user_angle_deg: f32` (7th positional arg, plumbed straight into `image_cm_for_rotation`'s 8th arg from US-R1). All 9 test call sites updated to pass 0.0.
+- Tests:
+  - `src/stores/stamp-store.test.ts` (6 tests) — defaults, in-range, 360→0, > 360 wrap, negative wrap, NaN/Infinity fallback.
+  - `src/components/preview-pane.test.tsx` (7 tests) — identity at 0, plus parametrized negate-the-angle for {30, 90, 145, 180, 270, 359}.
+  - `src/services/pdf-bridge.test.ts` extended with two `stampAllPdfs` rotationDeg tests (forwarded vs. omitted-as-undefined).
+- 32 cargo tests pass; 32 vitest tests pass; `npx tsc --noEmit` clean.
+- Files changed: `src/stores/stamp-store.ts`, `src/stores/stamp-store.test.ts` (new), `src/components/stamp-controls.tsx`, `src/components/preview-pane.tsx`, `src/components/preview-pane.test.tsx` (new), `src/services/pdf-bridge.ts`, `src/services/pdf-bridge.test.ts`, `src-tauri/src/commands.rs`, `src-tauri/src/pdf.rs`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- **Learnings**:
+  - **CCW user rotation vs. CW CSS rotation must be reconciled in the preview, not the store.** `rotationDeg` is stored as CCW around the stamp center (matches PDF y-up math and `affine_rotate_deg`). CSS `rotate()` is CW because screen y points down. So `preview-pane` applies `rotate(${-rotationDeg}deg)`, not `rotate(${rotationDeg}deg)`. If you trust the AC's literal `rotate(${rotationDeg}deg)` wording, the rendered PDF and the live preview will visibly disagree for asymmetric stamps at non-180° angles. The manual-verify step ("rendered PDF stamp matches the rotation") is the canary.
+  - JS template-literal `${-0}` stringifies to `"0"`, not `"-0"` — assertions on the no-op rotation case must expect `'rotate(0deg)'`. Caught this by running the test, fixed by special-casing the doc on the test, not the implementation (the template-literal coercion is fine in practice).
+  - Pure helpers exported from a component file beat full-DOM tests for testing one inline-style fragment. Mounting `PreviewPane` in jsdom would have required mocking `ResizeObserver`, `Image.naturalWidth`, plus seeding both Zustand stores. Extracting `stampRotationStyle` as a side-effect-free function gives a 7-test file with no setup.
+  - Vitest `it.each(table)('name with %d', (deg, expected) => ...)` is the cleanest pattern for parametrizing the rotation cases without copy-pasting six identical bodies. The first arg is the description template, the table elements unpack into the test fn's params.
+  - Tauri arg-name camelCase auto-conversion holds for f32 too: Rust `rotation_deg: Option<f32>` ↔ TS `rotationDeg?: number`. No `#[serde(rename)]` needed; this matches the prior `skip_indices ↔ skipIndices` precedent from US-002a/b.
+---
+

@@ -20,6 +20,9 @@ interface StampStore {
    * user may type while editing W/H — deriving aspect from current
    * widthPt/heightPt would corrupt to NaN or 0/Infinity in that window. */
   lockedAspect: number;
+  /** User-chosen stamp rotation in degrees CCW around the stamp's center.
+   * Normalized to [0, 360) by `setRotationDeg`. */
+  rotationDeg: number;
   isPlaced: boolean;
   isExporting: boolean;
   exportProgress: { current: number; total: number };
@@ -35,6 +38,7 @@ interface StampStore {
   setSize: (widthPt: number, heightPt: number) => void;
   setLockAspect: (locked: boolean) => void;
   setLockedAspect: (aspect: number) => void;
+  setRotationDeg: (deg: number) => void;
   setPlaced: (placed: boolean) => void;
   setExporting: (exporting: boolean) => void;
   setExportProgress: (current: number, total: number) => void;
@@ -54,6 +58,7 @@ export const useStampStore = create<StampStore>((set) => ({
   heightPt: 100,
   lockAspect: true,
   lockedAspect: 1,
+  rotationDeg: 0,
   isPlaced: false,
   isExporting: false,
   exportProgress: { current: 0, total: 0 },
@@ -73,6 +78,14 @@ export const useStampStore = create<StampStore>((set) => ({
   setSize: (widthPt, heightPt) => set({ widthPt, heightPt }),
   setLockAspect: (locked) => set({ lockAspect: locked }),
   setLockedAspect: (aspect) => set({ lockedAspect: aspect }),
+  setRotationDeg: (deg) => {
+    if (!Number.isFinite(deg)) {
+      set({ rotationDeg: 0 });
+      return;
+    }
+    const normalized = ((deg % 360) + 360) % 360;
+    set({ rotationDeg: normalized });
+  },
   setPlaced: (placed) => set({ isPlaced: placed }),
   setExporting: (exporting) => set({ isExporting: exporting }),
   setExportProgress: (current, total) =>

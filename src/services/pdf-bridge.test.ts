@@ -94,6 +94,23 @@ describe('stampAllPdfs skipIndices', () => {
     const args = call?.[1] as Record<string, unknown> | undefined;
     expect(args?.skipIndices).toBeUndefined();
   });
+
+  it('forwards rotationDeg under camelCase key', async () => {
+    invokeMock.mockResolvedValueOnce([]);
+    await stampAllPdfs({ ...baseParams, rotationDeg: 90 });
+    expect(invokeMock).toHaveBeenCalledWith(
+      'stamp_pdfs',
+      expect.objectContaining({ rotationDeg: 90 }),
+    );
+  });
+
+  it('passes rotationDeg as undefined when omitted (Rust treats as None → 0.0)', async () => {
+    invokeMock.mockResolvedValueOnce([]);
+    await stampAllPdfs(baseParams);
+    const call = invokeMock.mock.calls[0];
+    const args = call?.[1] as Record<string, unknown> | undefined;
+    expect(args?.rotationDeg).toBeUndefined();
+  });
 });
 
 describe('ConflictDecision type', () => {
