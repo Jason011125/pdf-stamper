@@ -1,9 +1,18 @@
-import { useCallback } from 'react';
+import { useCallback, useState } from 'react';
 import { useStampStore, type StampType } from '../stores/stamp-store';
 import { usePdfStore } from '../stores/pdf-store';
-import { stampAllPdfs, selectOutputDir } from '../services/pdf-bridge';
+import {
+  stampAllPdfs,
+  selectOutputDir,
+  checkOutputConflicts,
+  type Conflict,
+  type ConflictDecision,
+} from '../services/pdf-bridge';
 import { open } from '@tauri-apps/plugin-dialog';
 import { invoke } from '@tauri-apps/api/core';
+import { ConflictDialog } from './conflict-dialog';
+
+const STAMP_SUFFIX = '-stamped';
 
 async function readImagePreview(path: string): Promise<string> {
   const bytes = await invoke<number[]>('read_file_bytes', { path });
@@ -131,42 +140,78 @@ export function StampControls(): React.JSX.Element {
     [widthPt, heightPt, setLockAspect, setLockedAspect],
   );
 
+  const [pendingConflicts, setPendingConflicts] = useState<{
+    conflicts: Conflict[];
+    outputDir: string;
+  } | null>(null);
+
+  const runStamp = useCallback(
+    async (outputDir: string, skipIndices: number[]) => {
+      setExporting(true);
+      setExportProgress(0, files.length);
+      try {
+        const paths = files.map((f) => f.path);
+        const result = await stampAllPdfs({
+          paths,
+          stampType,
+          imagePath: stampType === 'image' ? imagePath : null,
+          text: stampType === 'text' ? text : null,
+          fontSize: stampType === 'text' ? fontSize : null,
+          fontName: stampType === 'text' ? fontName : null,
+          color: stampType === 'text' ? color : null,
+          x: xPt,
+          y: yPt,
+          width: widthPt,
+          height: heightPt,
+          outputDir,
+          skipIndices: skipIndices.length > 0 ? skipIndices : undefined,
+        });
+        setExportProgress(result.length, files.length);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        alert(`Export failed: ${message}`);
+      } finally {
+        setExporting(false);
+      }
+    },
+    [
+      files, stampType, imagePath, text, fontSize, fontName, color,
+      xPt, yPt, widthPt, heightPt, setExporting, setExportProgress,
+    ],
+  );
+
   const handleApplyAll = useCallback(async () => {
     if (files.length === 0 || !isPlaced) return;
 
     const dir = await selectOutputDir();
     if (!dir) return;
 
-    setExporting(true);
-    setExportProgress(0, files.length);
+    const conflicts = await checkOutputConflicts(
+      files.map((f) => ({ path: f.path })),
+      dir,
+      STAMP_SUFFIX,
+    );
 
-    try {
-      const paths = files.map((f) => f.path);
-      const result = await stampAllPdfs({
-        paths,
-        stampType,
-        imagePath: stampType === 'image' ? imagePath : null,
-        text: stampType === 'text' ? text : null,
-        fontSize: stampType === 'text' ? fontSize : null,
-        fontName: stampType === 'text' ? fontName : null,
-        color: stampType === 'text' ? color : null,
-        x: xPt,
-        y: yPt,
-        width: widthPt,
-        height: heightPt,
-        outputDir: dir,
-      });
-      setExportProgress(result.length, files.length);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      alert(`Export failed: ${message}`);
-    } finally {
-      setExporting(false);
+    if (conflicts.length === 0) {
+      await runStamp(dir, []);
+      return;
     }
-  }, [
-    files, isPlaced, stampType, imagePath, text, fontSize, fontName, color,
-    xPt, yPt, widthPt, heightPt, setExporting, setExportProgress,
-  ]);
+
+    setPendingConflicts({ conflicts, outputDir: dir });
+  }, [files, isPlaced, runStamp]);
+
+  const handleConflictsResolved = useCallback(
+    async (decisions: ConflictDecision[]) => {
+      const pending = pendingConflicts;
+      setPendingConflicts(null);
+      if (!pending) return;
+      const skipIndices = pending.conflicts
+        .filter((_, i) => decisions[i] === 'skip')
+        .map((c) => c.idx);
+      await runStamp(pending.outputDir, skipIndices);
+    },
+    [pendingConflicts, runStamp],
+  );
 
   return (
     <div className="flex flex-col h-full gap-4">
@@ -308,6 +353,13 @@ export function StampControls(): React.JSX.Element {
           ? `Exporting ${exportProgress.current}/${exportProgress.total}...`
           : `Apply to All (${files.length})`}
       </button>
+
+      {pendingConflicts && (
+        <ConflictDialog
+          conflicts={pendingConflicts.conflicts}
+          onDone={handleConflictsResolved}
+        />
+      )}
     </div>
   );
 }

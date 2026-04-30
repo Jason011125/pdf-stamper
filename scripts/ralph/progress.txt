@@ -70,3 +70,18 @@ Environment: Linux devcontainer (.devcontainer/)
   - When a TS field is `optional?: T`, passing it through to `invoke({ ...rest, key: params.key })` results in `key: undefined` on the args object. JSON.stringify drops `undefined`-valued keys, so Rust receives the field as absent — which deserializes to `Option::None`. No need to conditionally spread the field. The test asserts this with `args?.skipIndices === undefined` when callers omit it.
   - Convention reaffirmed: response struct fields stay snake_case in TS to match the Rust `Serialize` default (no `rename_all = "camelCase"`). PdfInfo set the precedent; ConflictEntry follows it. Going camelCase here would have desynced from the Rust side (which already shipped in US-002a) and required a Rust-side rename.
 ---
+
+## 2026-04-30 — US-002c
+- New `src/components/conflict-dialog.tsx`: pure-function reducer (`conflictReducer`) + `initialConflictState` + `isConflictComplete` + `ConflictDialog` React component (modal with Overwrite / Cancel / Overwrite all / Cancel all buttons).
+  - State shape: `{ total, currentIndex, decisions: ConflictDecision[], applyAllMode: 'overwrite'|'skip'|null }`.
+  - `overwrite-all` / `cancel-all` fill `decisions[currentIndex..total)` in one step and jump `currentIndex` to `total`, so subsequent conflicts auto-resolve without re-rendering the dialog.
+  - On completion, an effect fires `onDone(decisions)`; parent maps `decisions[i] === 'skip'` → `conflicts[i].idx` for `skipIndices`.
+- Wired into `stamp-controls.tsx`: Export now (1) selects output dir → (2) calls `checkOutputConflicts` → (3) if no conflicts, runs stamp directly; else opens the dialog and runs stamp after `onDone`.
+- Tests: `src/components/conflict-dialog.test.tsx` (11 tests) — covers all four buttons individually, the headline mixed scenario from the AC ("overwrite then cancel-all on 5"), `skip` then `overwrite-all`, fully manual mixes, post-completion no-op, and zero-conflict early completion.
+- Files changed: `src/components/conflict-dialog.tsx` (new), `src/components/conflict-dialog.test.tsx` (new), `src/components/stamp-controls.tsx`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- **Learnings**:
+  - `useReducer(reducer, total, initialConflictState)` — the third arg is an *init function* that receives the second arg. Cleaner than building the initial state inline; the reducer stays a pure binary function (state, action) which is what makes it trivially testable.
+  - `STAMP_SUFFIX = "-stamped"` is duplicated on both sides of the IPC boundary (`pdf::STAMP_SUFFIX` in Rust, a const in `stamp-controls.tsx`). Keeping them in sync is a manual concern; if it ever drifts to a third caller, consider exposing `STAMP_SUFFIX` from `pdf-bridge.ts` as the single TS source of truth.
+  - For dialog completion-callbacks, fire from `useEffect([state])` rather than directly inside the dispatch handler. The reducer should remain pure and synchronous; side effects (calling `onDone`) belong in the effect, which observes the state transition that the reducer already produced.
+  - Acceptance-criterion-driven test naming: each test title in `conflict-dialog.test.tsx` directly mirrors a phrase from the AC list. Easy to audit "did we cover all the AC?" by reading test names.
+---

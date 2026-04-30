@@ -46,8 +46,8 @@
         "Manual verify recipe in commit body: load 2 PDFs with the same filename in different dirs → click Export → expect dialog with 'Overwrite/Cancel/Overwrite all/Cancel all' buttons; verify each button's behavior."
       ],
       "priority": 3,
-      "passes": false,
-      "notes": "Depends on US-002a + US-002b."
+      "passes": true,
+      "notes": "Reducer + types live in components/conflict-dialog.tsx (exported: conflictReducer, initialConflictState, isConflictComplete, ConflictAction, ConflictState). Tests in conflict-dialog.test.tsx. UI uses STAMP_SUFFIX = '-stamped' duplicated as a const at the top of stamp-controls (matches Rust pdf::STAMP_SUFFIX). Dialog renders only when pendingConflicts state is set; on completion calls onDone(decisions) and parent maps conflict.idx → skipIndices."
     },
     {
       "id": "US-R1",
