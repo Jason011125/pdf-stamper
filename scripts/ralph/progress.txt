@@ -85,3 +85,15 @@ Environment: Linux devcontainer (.devcontainer/)
   - For dialog completion-callbacks, fire from `useEffect([state])` rather than directly inside the dispatch handler. The reducer should remain pure and synchronous; side effects (calling `onDone`) belong in the effect, which observes the state transition that the reducer already produced.
   - Acceptance-criterion-driven test naming: each test title in `conflict-dialog.test.tsx` directly mirrors a phrase from the AC list. Easy to audit "did we cover all the AC?" by reading test names.
 ---
+
+## 2026-04-30 — US-R1
+- Extended `image_cm_for_rotation` (`src-tauri/src/pdf.rs`) with an 8th parameter `user_angle_deg: f32` (CCW rotation around stamp center). The body is now `M_total = T_rotate^-1 · T(dx + w/2, dy + h/2) · R(user_angle) · T(-w/2, -h/2) · S(w, h)`, built from a new tier of affine helpers (`affine_mul`, `affine_translate`, `affine_scale`, `affine_rotate_deg`, `t_rotate_inverse`) added to the top of `pdf.rs`.
+- `stamp_image` call site updated to pass `0.0` for now. US-R2 will wire the real angle through StampConfig.
+- Tests (3 new): `image_cm_user_rotation_property` covers all four page rotations × seven user angles ({0, 30, 90, 145, 180, 270, 359}); `image_cm_user_rotation_zero_matches_legacy_matrices` is a byte-identity guard vs the previous closed-form expressions for each rotation; `stamp_image_user_rotation_zero_landscape_unchanged` is a real-PDF round-trip on a landscape /Rotate=270 page to make sure the call-site change didn't regress.
+- Files changed: `src-tauri/src/pdf.rs`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- **Learnings**:
+  - Replace closed-form match arms with composed affine helpers when the math grows beyond ~3 cases. `image_cm_for_rotation` previously had 4 hardcoded `[a,b,c,d,e,f]` rows; with user-rotation that would have ballooned to 4 × the rotation-matrix expansion. Building it as `affine_mul(T_rotate_inv, affine_mul(T(cx,cy), affine_mul(R(θ), affine_mul(T(-w/2,-h/2), S(w,h)))))` reads as the algebraic derivation, so anyone reviewing it can verify each step against the comment without expanding the 4 closed-form variants.
+  - Property test pattern that survives matrix refactors: rotate the *expected display corners* geometrically (`rotate_around` helper) and compare against `apply_t_rotate(apply_cm(corner))`. The test never touches the matrix expression, so it can't accidentally encode the same wrong derivation as a buggy implementation (the c6a9a80 / 9f2b85b lesson applied to user-rotation).
+  - Two related but separate sign conventions live in the same file now: PDF's `/Rotate` is CW (raw → display), but user rotation is CCW (industry convention for "rotate this image"). The `affine_rotate_deg` doc comment + the `image_cm_for_rotation` doc comment both call out CCW explicitly; future code that mixes the two should preserve that distinction in names (`*_deg_ccw`?) if it gets confusing.
+---
+

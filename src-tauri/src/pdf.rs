@@ -257,34 +257,87 @@ pub fn render_page_to_png(pdf_bytes: &[u8], target_width: u16) -> Result<Vec<u8>
     Ok(png_bytes)
 }
 
+// 2D affine matrix in PDF cm form: [a, b, c, d, e, f] representing the
+// affine map (x, y) → (a*x + c*y + e, b*x + d*y + f).
+type Affine = [f32; 6];
+
+const AFFINE_IDENTITY: Affine = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+
+/// Compose two affine maps: result(p) = a(b(p)).
+fn affine_mul(a: Affine, b: Affine) -> Affine {
+    [
+        a[0] * b[0] + a[2] * b[1],
+        a[1] * b[0] + a[3] * b[1],
+        a[0] * b[2] + a[2] * b[3],
+        a[1] * b[2] + a[3] * b[3],
+        a[0] * b[4] + a[2] * b[5] + a[4],
+        a[1] * b[4] + a[3] * b[5] + a[5],
+    ]
+}
+
+fn affine_translate(tx: f32, ty: f32) -> Affine {
+    [1.0, 0.0, 0.0, 1.0, tx, ty]
+}
+
+fn affine_scale(sx: f32, sy: f32) -> Affine {
+    [sx, 0.0, 0.0, sy, 0.0, 0.0]
+}
+
+/// CCW rotation by `deg` degrees around the origin.
+fn affine_rotate_deg(deg: f32) -> Affine {
+    let rad = deg.to_radians();
+    let (cs, sn) = (rad.cos(), rad.sin());
+    [cs, sn, -sn, cs, 0.0, 0.0]
+}
+
+/// Inverse of the viewer's `T_rotate` (raw → display): maps display → raw.
+/// Identity for `/Rotate=0`.
+fn t_rotate_inverse(rotation: u32, raw_w: f32, raw_h: f32) -> Affine {
+    match rotation {
+        90  => [ 0.0,  1.0, -1.0,  0.0, raw_w, 0.0  ],
+        180 => [-1.0,  0.0,  0.0, -1.0, raw_w, raw_h],
+        270 => [ 0.0, -1.0,  1.0,  0.0, 0.0,   raw_h],
+        _   => AFFINE_IDENTITY,
+    }
+}
+
 /// Compute the `cm` matrix [a, b, c, d, e, f] for placing an image stamp at
-/// display position `(dx, dy)` with display size `(sw, sh)` on a page whose
-/// raw MediaBox is `(raw_w, raw_h)` and whose `/Rotate` is `rotation` degrees CW.
+/// display position `(dx, dy)` with display size `(sw, sh)`, optionally
+/// rotated by `user_angle_deg` (CCW) around the stamp's center, on a page
+/// whose raw MediaBox is `(raw_w, raw_h)` and whose `/Rotate` is `rotation`
+/// degrees CW.
 ///
 /// PDF Image XObject convention (PDF 1.7 §8.9.5): the source image's first
 /// sample (top-left) maps to unit-square (0, 1) and the last (bottom-right)
 /// to (1, 0). The minimal "upright at (x, y) sized (w, h)" matrix is therefore
 /// `[w, 0, 0, h, x, y]` — no Y flip.
 ///
-/// For rotated pages, the viewer applies `T_rotate` (raw → display) at render
-/// time; we compose `M_display→raw · M_image→display` so that, after the viewer
-/// rotates by `rotation`° CW, the stamp lands upright at display `(dx, dy)`.
+/// The full composition is
+///
+/// ```text
+///   M_total = T_rotate^-1 · T(dx + w/2, dy + h/2) · R(user_angle)
+///                         · T(-w/2, -h/2) · S(w, h)
+/// ```
+///
+/// so that a unit-square corner is first scaled to the stamp size, recentered
+/// at the origin, rotated, translated to the stamp's display position, and
+/// finally mapped from display coordinates back to raw coordinates that the
+/// viewer's `T_rotate` will undo.
 ///
 /// **Do not modify without re-verifying via the property-based tests** in this
-/// module (see `assert_stamp_corners_at_display`). The full derivation lives
-/// in `.claude/CLAUDE.md` under "PDF Image Stamp `cm` Matrix Recipe".
+/// module (see `assert_image_cm_lands_at_user_rotated`). The full derivation
+/// lives in `.claude/CLAUDE.md` under "PDF Image Stamp `cm` Matrix Recipe".
 fn image_cm_for_rotation(
     rotation: u32,
     dx: f32, dy: f32,
     sw: f32, sh: f32,
     raw_w: f32, raw_h: f32,
-) -> [f32; 6] {
-    match rotation {
-        90  => [0.0,  sw, -sh, 0.0, raw_w - dy, dx],
-        180 => [-sw, 0.0, 0.0, -sh, raw_w - dx, raw_h - dy],
-        270 => [0.0, -sw,  sh, 0.0, dy, raw_h - dx],
-        _   => [sw,  0.0, 0.0,  sh, dx, dy],
-    }
+    user_angle_deg: f32,
+) -> Affine {
+    let m = affine_mul(affine_translate(-sw / 2.0, -sh / 2.0), affine_scale(sw, sh));
+    let m = affine_mul(affine_rotate_deg(user_angle_deg), m);
+    let m = affine_mul(affine_translate(dx + sw / 2.0, dy + sh / 2.0), m);
+    affine_mul(t_rotate_inverse(rotation, raw_w, raw_h), m)
 }
 
 /// Compute the coordinate-space `cm` matrix used for text stamps. After
@@ -353,7 +406,7 @@ pub fn stamp_image(
     // correct position and orientation in the displayed (rotated) page.
     let img_ref_name = b"Img0";
     let [a, b, c, d, e, f] = image_cm_for_rotation(
-        geo.rotation, x, y, width, height, geo.raw_width, geo.raw_height,
+        geo.rotation, x, y, width, height, geo.raw_width, geo.raw_height, 0.0,
     );
     let form_ops = vec![
         Operation::new("q", vec![]),
@@ -1426,6 +1479,109 @@ mod tests {
         let img = make_red_png();
         let stamped = stamp_image(&pdf, &img, 50.0, 30.0, 200.0, 80.0).unwrap();
         assert_stamp_renders_at_display(&stamped, 90, 1000.0, 400.0, 50.0, 30.0, 200.0, 80.0);
+    }
+
+    // -- Tests: image_cm_for_rotation with user-chosen rotation ------------
+    //
+    // These tests pin down the property we care about: a stamp drawn at
+    // display rectangle (dx, dy)..(dx+w, dy+h) and rotated by `user_angle`
+    // CCW around its center must, after the viewer applies `T_rotate`,
+    // land on the corners of that rotated rectangle. The test computes the
+    // expected corner positions geometrically (rotate-around-center) rather
+    // than re-encoding the same matrix derivation as the implementation.
+
+    /// Rotate `p` by `angle_deg` CCW around `c`.
+    fn rotate_around(p: (f32, f32), c: (f32, f32), angle_deg: f32) -> (f32, f32) {
+        let rad = angle_deg.to_radians();
+        let (cs, sn) = (rad.cos(), rad.sin());
+        let (dx, dy) = (p.0 - c.0, p.1 - c.1);
+        (c.0 + dx * cs - dy * sn, c.1 + dx * sn + dy * cs)
+    }
+
+    /// Verify that `image_cm_for_rotation` produces a matrix whose unit-square
+    /// corners, after `apply_cm` then `apply_t_rotate`, land on the corners of
+    /// the user-rotated display rectangle.
+    fn assert_image_cm_lands_at_user_rotated(
+        page_rotation: u32,
+        raw_w: f32, raw_h: f32,
+        dx: f32, dy: f32, w: f32, h: f32,
+        user_angle: f32,
+    ) {
+        let cm = image_cm_for_rotation(page_rotation, dx, dy, w, h, raw_w, raw_h, user_angle);
+        let center = (dx + w / 2.0, dy + h / 2.0);
+        let unrotated_corners: [((f32, f32), (f32, f32)); 4] = [
+            ((0.0, 0.0), (dx,     dy)),
+            ((1.0, 0.0), (dx + w, dy)),
+            ((0.0, 1.0), (dx,     dy + h)),
+            ((1.0, 1.0), (dx + w, dy + h)),
+        ];
+        for (unit, unrotated_disp) in unrotated_corners {
+            let raw = apply_cm(cm, unit);
+            let disp = apply_t_rotate(page_rotation, raw, raw_w, raw_h);
+            let expected = rotate_around(unrotated_disp, center, user_angle);
+            assert!(
+                (disp.0 - expected.0).abs() < 0.01 && (disp.1 - expected.1).abs() < 0.01,
+                "page_rotation={}, user_angle={}, unit={:?}: expected display {:?} got {:?}",
+                page_rotation, user_angle, unit, expected, disp,
+            );
+        }
+    }
+
+    #[test]
+    fn image_cm_user_rotation_property() {
+        // Cover all four page rotations crossed with several user angles
+        // (including 0 to confirm backward compatibility, and 359 to probe
+        // wraparound). raw_w != raw_h surfaces any matrix that mixes them.
+        let raw_w = 612.0_f32;
+        let raw_h = 792.0_f32;
+        let (dx, dy, w, h) = (100.0_f32, 200.0_f32, 150.0_f32, 75.0_f32);
+        for &page_rotation in &[0_u32, 90, 180, 270] {
+            for &user_angle in &[0.0_f32, 30.0, 90.0, 145.0, 180.0, 270.0, 359.0] {
+                assert_image_cm_lands_at_user_rotated(
+                    page_rotation, raw_w, raw_h, dx, dy, w, h, user_angle,
+                );
+            }
+        }
+    }
+
+    /// Byte-identity guard: with `user_angle_deg = 0.0`, the matrix produced
+    /// by `image_cm_for_rotation` must equal the previous closed-form
+    /// expression (which had no user-rotation parameter). Any future refactor
+    /// that breaks this is a regression.
+    #[test]
+    fn image_cm_user_rotation_zero_matches_legacy_matrices() {
+        let raw_w = 612.0_f32;
+        let raw_h = 792.0_f32;
+        let (dx, dy, sw, sh) = (100.0_f32, 200.0_f32, 150.0_f32, 75.0_f32);
+        let cases: [(u32, [f32; 6]); 4] = [
+            (0,   [sw,  0.0, 0.0,  sh, dx, dy]),
+            (90,  [0.0,  sw, -sh, 0.0, raw_w - dy, dx]),
+            (180, [-sw, 0.0, 0.0, -sh, raw_w - dx, raw_h - dy]),
+            (270, [0.0, -sw,  sh, 0.0, dy, raw_h - dx]),
+        ];
+        for (rot, expected) in cases {
+            let actual = image_cm_for_rotation(rot, dx, dy, sw, sh, raw_w, raw_h, 0.0);
+            for k in 0..6 {
+                assert!(
+                    (actual[k] - expected[k]).abs() < 1e-4,
+                    "rot={}, idx={}: expected {} got {} (full actual={:?})",
+                    rot, k, expected[k], actual[k], actual,
+                );
+            }
+        }
+    }
+
+    /// Real PDF round-trip: pass through `stamp_image` (always user_angle=0
+    /// in production until US-R2 wires it through) and confirm the existing
+    /// `assert_stamp_renders_at_display` invariants still hold for landscape
+    /// pages — a sanity check that adding the user_angle parameter didn't
+    /// regress the call site.
+    #[test]
+    fn stamp_image_user_rotation_zero_landscape_unchanged() {
+        let pdf = make_test_pdf(1000.0, 400.0, Some(270));
+        let img = make_red_png();
+        let stamped = stamp_image(&pdf, &img, 50.0, 30.0, 200.0, 80.0).unwrap();
+        assert_stamp_renders_at_display(&stamped, 270, 1000.0, 400.0, 50.0, 30.0, 200.0, 80.0);
     }
 
     // -- Tests: coord_cm_for_rotation (property-based) ---------------------

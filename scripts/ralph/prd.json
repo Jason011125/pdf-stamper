@@ -61,8 +61,8 @@
         "Existing behavior with user_angle=0 must be byte-identical to current image_cm_for_rotation."
       ],
       "priority": 4,
-      "passes": false,
-      "notes": "Independent of US-002* — different code path. Touch pdf.rs production code is expected here (this is a feature, not a test refactor)."
+      "passes": true,
+      "notes": "image_cm_for_rotation now takes user_angle_deg: f32 as its 8th positional arg (CCW around stamp center). Built from new affine helpers (affine_mul/translate/scale/rotate_deg + t_rotate_inverse) at the top of pdf.rs. stamp_image passes 0.0 for now — US-R2 plumbs the real angle through. Property tests cover all 4 page rotations × 7 user angles + a byte-identity guard vs the previous closed-form matrices."
     },
     {
       "id": "US-R2",
