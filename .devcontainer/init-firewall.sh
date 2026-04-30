@@ -3,7 +3,9 @@
 # adds resolved IPs to an ipset, then drops any outbound traffic that's
 # not in the set (and not part of an established connection).
 #
-# Invoked as root via the NOPASSWD sudoers rule from postStartCommand.
+# Runs as the `node` user; uses sudo for each iptables/ipset call. The
+# sudoers NOPASSWD rule (configured in the Dockerfile) covers exactly
+# those binaries — no password prompt expected.
 #
 # Failure modes:
 #   - iptables/ipset unavailable (rare in node:20-bookworm, but theoretically
@@ -39,10 +41,10 @@ fi
 
 # Try to create or flush the ipset. If the kernel doesn't support it
 # (some Docker Desktop configurations) bail out non-fatally.
-if ipset list -n 2>/dev/null | grep -qx allowed-domains; then
-  ipset flush allowed-domains
+if sudo ipset list -n 2>/dev/null | grep -qx allowed-domains; then
+  sudo ipset flush allowed-domains
 else
-  if ! ipset create allowed-domains hash:ip family inet hashsize 4096 maxelem 100000 2>/dev/null; then
+  if ! sudo ipset create allowed-domains hash:ip family inet hashsize 4096 maxelem 100000 2>/dev/null; then
     echo "ipset create failed (kernel likely lacks ip_set module); skipping firewall" >&2
     exit 0
   fi
@@ -51,20 +53,20 @@ fi
 # Resolve every allowlisted host and add A records to the set.
 for host in "${ALLOWLIST[@]}"; do
   while read -r ip; do
-    [ -n "$ip" ] && ipset add allowed-domains "$ip" -exist
+    [ -n "$ip" ] && sudo ipset add allowed-domains "$ip" -exist
   done < <(getent ahosts "$host" 2>/dev/null | awk '/STREAM/ {print $1}' | sort -u)
 done
 
 # Reset and apply OUTPUT rules. Default policy DROP, then explicit allows.
-iptables -F OUTPUT
-iptables -P OUTPUT DROP
-iptables -A OUTPUT -o lo -j ACCEPT
-iptables -A OUTPUT -d 127.0.0.0/8 -j ACCEPT
-iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+sudo iptables -F OUTPUT
+sudo iptables -P OUTPUT DROP
+sudo iptables -A OUTPUT -o lo -j ACCEPT
+sudo iptables -A OUTPUT -d 127.0.0.0/8 -j ACCEPT
+sudo iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 # DNS (so future lookups inside the container still work)
-iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
-iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT
+sudo iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
+sudo iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT
 # The allowlist
-iptables -A OUTPUT -m set --match-set allowed-domains dst -j ACCEPT
+sudo iptables -A OUTPUT -m set --match-set allowed-domains dst -j ACCEPT
 
 echo "firewall active; allowlist: ${ALLOWLIST[*]}"
