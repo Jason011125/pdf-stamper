@@ -60,8 +60,13 @@ export async function checkOutputConflicts(
   });
 }
 
-export interface StampParams {
-  paths: string[];
+/** One PDF's complete stamp configuration. The frontend builds an array of
+ * these (one per loaded PDF, computed via `getEffectiveConfig(pdfId)`) before
+ * invoking `stampAllPdfs`. Stamp content fields (imagePath/text/...) are
+ * per-job for symmetry with the store's `StampConfig`, even though the UI
+ * keeps stamp content global today. */
+export interface StampJob {
+  path: string;
   stampType: 'image' | 'text';
   imagePath: string | null;
   text: string | null;
@@ -74,24 +79,17 @@ export interface StampParams {
   height: number;
   /** Stamp rotation in degrees CCW around the stamp's center. */
   rotationDeg?: number;
+}
+
+export interface StampParams {
+  jobs: StampJob[];
   outputDir: string;
   skipIndices?: number[];
 }
 
 export async function stampAllPdfs(params: StampParams): Promise<string[]> {
   return invoke<string[]>('stamp_pdfs', {
-    paths: params.paths,
-    stampType: params.stampType,
-    imagePath: params.imagePath,
-    text: params.text,
-    fontSize: params.fontSize,
-    fontName: params.fontName,
-    color: params.color,
-    x: params.x,
-    y: params.y,
-    width: params.width,
-    height: params.height,
-    rotationDeg: params.rotationDeg,
+    jobs: params.jobs,
     outputDir: params.outputDir,
     skipIndices: params.skipIndices,
   });

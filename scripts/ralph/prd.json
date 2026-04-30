@@ -129,8 +129,8 @@
         "Manual verify recipe in commit body: load 5 PDFs, set distinct positions and rotations on each, export, open all 5 in a viewer, confirm each is correct."
       ],
       "priority": 8,
-      "passes": false,
-      "notes": "Depends on US-P1, US-P2, US-R1."
+      "passes": true,
+      "notes": "Rust commands::stamp_pdfs collapsed to a thin async wrapper around new pdf::run_stamp_jobs (non-async, testable). StampJob struct lives in pdf.rs (Deserialize + rename_all=camelCase). Image bytes are cached by image_path so repeated jobs with the same image read once. Frontend StampParams shape changed to { jobs: StampJob[]; outputDir; skipIndices? } — components iterate files and call getEffectiveConfig(f.path) per file to assemble jobs. Tests: pdf::run_stamp_jobs_applies_per_pdf_configs (3 PDFs with distinct (x,y,w,h,rotation) verified via parse_stamp_placement + corner-rotated-around-center geometry), pdf::run_stamp_jobs_respects_skip_indices, plus the rewritten pdf-bridge.test.ts 'jobs payload' describe block. All 34 cargo + 50 vitest pass."
     }
   ]
 }

@@ -2,7 +2,7 @@ use image::GenericImageView;
 use lopdf::content::{Content, Operation};
 use lopdf::Object::Name;
 use lopdf::{Dictionary, Document, Object, Stream};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Suffix appended to a PDF's file stem when computing its stamped output path.
@@ -57,6 +57,80 @@ pub fn check_output_conflicts(
             }
         })
         .collect()
+}
+
+/// One PDF's complete stamp configuration. Carried over IPC from the frontend
+/// (`StampConfig` for a single PDF, materialized via `getEffectiveConfig`).
+/// Stamp content fields (image_path, text, ...) are per-job for symmetry with
+/// `StampConfig`, even though today's UI keeps stamp content global across
+/// loaded PDFs — only position/size/rotation actually vary per file.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct StampJob {
+    pub path: String,
+    pub stamp_type: String,
+    pub image_path: Option<String>,
+    pub text: Option<String>,
+    pub font_size: Option<f32>,
+    pub font_name: Option<String>,
+    pub color: Option<String>,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub rotation_deg: Option<f32>,
+}
+
+/// Run a batch of per-PDF stamp jobs to disk. Reads each distinct image
+/// once (cached by path), then applies the per-job stamp_image / stamp_text
+/// to each input, writing each output to `output_dir/<stem><suffix>.pdf`.
+/// Indices in `skip_indices` are skipped (no file written for those jobs).
+///
+/// This is the non-async core of `commands::stamp_pdfs`; the Tauri handler
+/// is a thin wrapper. Lives here so the per-job dispatch + caching can be
+/// covered by a real-PDF integration test that loads pdfium directly.
+pub fn run_stamp_jobs(
+    jobs: &[StampJob],
+    output_dir: &str,
+    skip_indices: &[usize],
+) -> Result<Vec<String>, PdfError> {
+    let mut image_cache: std::collections::HashMap<String, Vec<u8>> =
+        std::collections::HashMap::new();
+    for job in jobs {
+        if job.stamp_type == "image" {
+            if let Some(p) = &job.image_path {
+                if !image_cache.contains_key(p) {
+                    let bytes = std::fs::read(p)?;
+                    image_cache.insert(p.clone(), bytes);
+                }
+            }
+        }
+    }
+
+    let paths: Vec<String> = jobs.iter().map(|j| j.path.clone()).collect();
+
+    stamp_paths_to_disk(&paths, skip_indices, output_dir, STAMP_SUFFIX, |idx, pdf_bytes| {
+        let job = &jobs[idx];
+        let rot = job.rotation_deg.unwrap_or(0.0);
+        match job.stamp_type.as_str() {
+            "image" => {
+                let img = job
+                    .image_path
+                    .as_deref()
+                    .and_then(|p| image_cache.get(p))
+                    .ok_or_else(|| PdfError::StampError("No image data provided".into()))?;
+                stamp_image(pdf_bytes, img, job.x, job.y, job.width, job.height, rot)
+            }
+            "text" => {
+                let txt = job.text.as_deref().unwrap_or("STAMP");
+                let size = job.font_size.unwrap_or(24.0);
+                let font = job.font_name.as_deref().unwrap_or("Helvetica");
+                let rgb = job.color.as_deref().and_then(parse_hex_color);
+                stamp_text(pdf_bytes, txt, job.x, job.y, size, font, rgb)
+            }
+            other => Err(PdfError::StampError(format!("Unknown stamp type: {}", other))),
+        }
+    })
 }
 
 /// Iterate `paths`, skipping any whose index is in `skip_indices`, applying
@@ -2087,6 +2161,147 @@ mod tests {
 
         assert_eq!(written.len(), 1);
         assert!(written[0].ends_with("doc-stamped.pdf"));
+
+        let _ = std::fs::remove_dir_all(&in_dir);
+        let _ = std::fs::remove_dir_all(&out_dir);
+    }
+
+    // -- Tests: run_stamp_jobs (per-PDF configs, US-P3) ----------------------
+
+    /// Build a StampJob for an image stamp at the given placement on `path`.
+    fn img_job(
+        path: &str,
+        image_path: &str,
+        x: f32, y: f32, w: f32, h: f32,
+        rot: f32,
+    ) -> StampJob {
+        StampJob {
+            path: path.to_string(),
+            stamp_type: "image".to_string(),
+            image_path: Some(image_path.to_string()),
+            text: None,
+            font_size: None,
+            font_name: None,
+            color: None,
+            x,
+            y,
+            width: w,
+            height: h,
+            rotation_deg: Some(rot),
+        }
+    }
+
+    /// Verify a stamped output landed at the user-rotated rectangle around the
+    /// stamp center. Mirrors `image_cm_user_rotation_property`'s corner
+    /// geometry but reads the cm chain from the actual stamped PDF.
+    fn assert_stamp_rotates_around_center(
+        stamped_pdf: &[u8],
+        page_rotation: u32,
+        raw_w: f32, raw_h: f32,
+        dx: f32, dy: f32, w: f32, h: f32,
+        user_angle: f32,
+    ) {
+        let p = parse_stamp_placement(stamped_pdf);
+        let cm = compose(&[p.inner_cm, p.form_matrix, p.page_ctm]);
+        let center = (dx + w / 2.0, dy + h / 2.0);
+        let unrotated_corners: [((f32, f32), (f32, f32)); 4] = [
+            ((0.0, 0.0), (dx,     dy)),
+            ((1.0, 0.0), (dx + w, dy)),
+            ((0.0, 1.0), (dx,     dy + h)),
+            ((1.0, 1.0), (dx + w, dy + h)),
+        ];
+        for (unit, unrotated_disp) in unrotated_corners {
+            let raw = apply_cm(cm, unit);
+            let disp = apply_t_rotate(page_rotation, raw, raw_w, raw_h);
+            let expected = rotate_around(unrotated_disp, center, user_angle);
+            assert!(
+                (disp.0 - expected.0).abs() < 0.5 && (disp.1 - expected.1).abs() < 0.5,
+                "user_angle={}, unit={:?}: expected display {:?} got {:?}",
+                user_angle, unit, expected, disp,
+            );
+        }
+    }
+
+    /// Headline US-P3 test: three PDFs stamped via run_stamp_jobs, each with
+    /// its own (x, y, w, h, rotation_deg). Reading the cm chain back from each
+    /// output verifies the per-job dispatch actually used that file's params.
+    #[test]
+    fn run_stamp_jobs_applies_per_pdf_configs() {
+        let in_dir = make_tempdir("perpdf-in");
+        let out_dir = make_tempdir("perpdf-out");
+
+        // Three input PDFs with the same MediaBox.
+        let raw_w = 612.0_f32;
+        let raw_h = 792.0_f32;
+        let names = ["alpha", "beta", "gamma"];
+        let mut input_paths = Vec::new();
+        for n in &names {
+            let p = in_dir.join(format!("{}.pdf", n));
+            std::fs::write(&p, make_test_pdf(raw_w, raw_h, None)).unwrap();
+            input_paths.push(p.to_str().unwrap().to_string());
+        }
+
+        // One image, reused (verifies the cache path).
+        let img_path = in_dir.join("stamp.png");
+        std::fs::write(&img_path, make_red_png()).unwrap();
+        let img_str = img_path.to_str().unwrap();
+
+        // Distinct per-file placements; gamma carries a non-zero rotation.
+        let placements = [
+            (50.0_f32, 60.0_f32, 100.0_f32, 80.0_f32, 0.0_f32),
+            (200.0,    300.0,    150.0,    75.0,     0.0),
+            (100.0,    200.0,    50.0,     50.0,     45.0),
+        ];
+        let jobs: Vec<StampJob> = input_paths
+            .iter()
+            .zip(&placements)
+            .map(|(path, (x, y, w, h, rot))| img_job(path, img_str, *x, *y, *w, *h, *rot))
+            .collect();
+
+        let written =
+            run_stamp_jobs(&jobs, out_dir.to_str().unwrap(), &[]).unwrap();
+        assert_eq!(written.len(), 3);
+
+        for (out_path, (x, y, w, h, rot)) in written.iter().zip(&placements) {
+            let bytes = std::fs::read(out_path).unwrap();
+            assert_stamp_rotates_around_center(
+                &bytes, 0, raw_w, raw_h, *x, *y, *w, *h, *rot,
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&in_dir);
+        let _ = std::fs::remove_dir_all(&out_dir);
+    }
+
+    /// run_stamp_jobs respects skip_indices (skipped jobs produce no output).
+    #[test]
+    fn run_stamp_jobs_respects_skip_indices() {
+        let in_dir = make_tempdir("skipperpdf-in");
+        let out_dir = make_tempdir("skipperpdf-out");
+
+        let raw_w = 612.0_f32;
+        let raw_h = 792.0_f32;
+        let mut input_paths = Vec::new();
+        for n in &["a", "b", "c"] {
+            let p = in_dir.join(format!("{}.pdf", n));
+            std::fs::write(&p, make_test_pdf(raw_w, raw_h, None)).unwrap();
+            input_paths.push(p.to_str().unwrap().to_string());
+        }
+        let img_path = in_dir.join("stamp.png");
+        std::fs::write(&img_path, make_red_png()).unwrap();
+        let img_str = img_path.to_str().unwrap();
+
+        let jobs: Vec<StampJob> = input_paths
+            .iter()
+            .map(|p| img_job(p, img_str, 10.0, 20.0, 30.0, 40.0, 0.0))
+            .collect();
+
+        let written =
+            run_stamp_jobs(&jobs, out_dir.to_str().unwrap(), &[1]).unwrap();
+        assert_eq!(written.len(), 2);
+        assert!(written[0].ends_with("a-stamped.pdf"));
+        assert!(written[1].ends_with("c-stamped.pdf"));
+        assert!(!out_dir.join("b-stamped.pdf").exists());
 
         let _ = std::fs::remove_dir_all(&in_dir);
         let _ = std::fs::remove_dir_all(&out_dir);

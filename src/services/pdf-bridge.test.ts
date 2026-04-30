@@ -57,13 +57,13 @@ describe('checkOutputConflicts', () => {
   });
 });
 
-describe('stampAllPdfs skipIndices', () => {
+describe('stampAllPdfs jobs payload', () => {
   beforeEach(() => {
     invokeMock.mockReset();
   });
 
-  const baseParams = {
-    paths: ['/a.pdf', '/b.pdf'],
+  const baseJob = {
+    path: '/a.pdf',
     stampType: 'text' as const,
     imagePath: null,
     text: 'STAMP',
@@ -74,10 +74,24 @@ describe('stampAllPdfs skipIndices', () => {
     y: 20,
     width: 100,
     height: 50,
+  };
+
+  const baseParams = {
+    jobs: [baseJob, { ...baseJob, path: '/b.pdf' }],
     outputDir: '/out',
   };
 
-  it('forwards skipIndices to the stamp_pdfs command when provided', async () => {
+  it('forwards jobs and outputDir to stamp_pdfs (camelCase keys)', async () => {
+    invokeMock.mockResolvedValueOnce([]);
+    await stampAllPdfs(baseParams);
+    expect(invokeMock).toHaveBeenCalledWith('stamp_pdfs', {
+      jobs: baseParams.jobs,
+      outputDir: '/out',
+      skipIndices: undefined,
+    });
+  });
+
+  it('forwards skipIndices when provided', async () => {
     invokeMock.mockResolvedValueOnce([]);
     await stampAllPdfs({ ...baseParams, skipIndices: [1] });
     expect(invokeMock).toHaveBeenCalledWith(
@@ -95,21 +109,33 @@ describe('stampAllPdfs skipIndices', () => {
     expect(args?.skipIndices).toBeUndefined();
   });
 
-  it('forwards rotationDeg under camelCase key', async () => {
+  it('forwards per-job rotationDeg verbatim inside jobs', async () => {
     invokeMock.mockResolvedValueOnce([]);
-    await stampAllPdfs({ ...baseParams, rotationDeg: 90 });
-    expect(invokeMock).toHaveBeenCalledWith(
-      'stamp_pdfs',
-      expect.objectContaining({ rotationDeg: 90 }),
-    );
-  });
-
-  it('passes rotationDeg as undefined when omitted (Rust treats as None → 0.0)', async () => {
-    invokeMock.mockResolvedValueOnce([]);
-    await stampAllPdfs(baseParams);
+    const jobs = [
+      { ...baseJob, path: '/a.pdf', rotationDeg: 90 },
+      { ...baseJob, path: '/b.pdf', rotationDeg: 180 },
+    ];
+    await stampAllPdfs({ jobs, outputDir: '/out' });
     const call = invokeMock.mock.calls[0];
     const args = call?.[1] as Record<string, unknown> | undefined;
-    expect(args?.rotationDeg).toBeUndefined();
+    const sentJobs = args?.jobs as Array<Record<string, unknown>>;
+    expect(sentJobs[0]?.rotationDeg).toBe(90);
+    expect(sentJobs[1]?.rotationDeg).toBe(180);
+  });
+
+  it('per-PDF jobs may carry distinct (x, y) values', async () => {
+    invokeMock.mockResolvedValueOnce([]);
+    const jobs = [
+      { ...baseJob, path: '/a.pdf', x: 10, y: 20 },
+      { ...baseJob, path: '/b.pdf', x: 300, y: 400 },
+    ];
+    await stampAllPdfs({ jobs, outputDir: '/out' });
+    const args = invokeMock.mock.calls[0]?.[1] as Record<string, unknown>;
+    const sentJobs = args.jobs as Array<Record<string, unknown>>;
+    expect(sentJobs[0]?.x).toBe(10);
+    expect(sentJobs[0]?.y).toBe(20);
+    expect(sentJobs[1]?.x).toBe(300);
+    expect(sentJobs[1]?.y).toBe(400);
   });
 });
 

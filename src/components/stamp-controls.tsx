@@ -7,6 +7,7 @@ import {
   checkOutputConflicts,
   type Conflict,
   type ConflictDecision,
+  type StampJob,
 } from '../services/pdf-bridge';
 import { open } from '@tauri-apps/plugin-dialog';
 import { invoke } from '@tauri-apps/api/core';
@@ -47,7 +48,6 @@ export function StampControls(): React.JSX.Element {
   const imagePreviewUrl = useStampStore(
     (s) => s.getEffectiveConfig(currentPdfId).imagePreviewUrl,
   );
-  const imagePath = useStampStore((s) => s.getEffectiveConfig(currentPdfId).imagePath);
   const setImage = useStampStore((s) => s.setImage);
   const clearImage = useStampStore((s) => s.clearImage);
   const text = useStampStore((s) => s.getEffectiveConfig(currentPdfId).text);
@@ -78,7 +78,6 @@ export function StampControls(): React.JSX.Element {
   const setExporting = useStampStore((s) => s.setExporting);
   const exportProgress = useStampStore((s) => s.exportProgress);
   const setExportProgress = useStampStore((s) => s.setExportProgress);
-  const fontName = useStampStore((s) => s.getEffectiveConfig(currentPdfId).fontFamily);
 
   const handleImageUpload = useCallback(async () => {
     const selected = await open({
@@ -162,25 +161,39 @@ export function StampControls(): React.JSX.Element {
     outputDir: string;
   } | null>(null);
 
+  // getEffectiveConfig is a function selector (returns a fresh object on each
+  // call). Subscribing to it directly would re-render every state change —
+  // instead we pull it from the store imperatively at submit time.
+  const getEffectiveConfig = useStampStore((s) => s.getEffectiveConfig);
+
   const runStamp = useCallback(
     async (outputDir: string, skipIndices: number[]) => {
       setExporting(true);
       setExportProgress(0, files.length);
       try {
-        const paths = files.map((f) => f.path);
+        // Assemble per-PDF jobs: each loaded PDF gets its effective config
+        // (default merged with that PDF's override). Position/size/rotation
+        // can therefore differ per file; stamp content is the same across
+        // files in today's UI but the per-job shape leaves room for that.
+        const jobs: StampJob[] = files.map((f) => {
+          const cfg = getEffectiveConfig(f.path);
+          return {
+            path: f.path,
+            stampType: cfg.type,
+            imagePath: cfg.type === 'image' ? cfg.imagePath : null,
+            text: cfg.type === 'text' ? cfg.text : null,
+            fontSize: cfg.type === 'text' ? cfg.fontSize : null,
+            fontName: cfg.type === 'text' ? cfg.fontFamily : null,
+            color: cfg.type === 'text' ? cfg.color : null,
+            x: cfg.xPt,
+            y: cfg.yPt,
+            width: cfg.widthPt,
+            height: cfg.heightPt,
+            rotationDeg: cfg.rotationDeg,
+          };
+        });
         const result = await stampAllPdfs({
-          paths,
-          stampType,
-          imagePath: stampType === 'image' ? imagePath : null,
-          text: stampType === 'text' ? text : null,
-          fontSize: stampType === 'text' ? fontSize : null,
-          fontName: stampType === 'text' ? fontName : null,
-          color: stampType === 'text' ? color : null,
-          x: xPt,
-          y: yPt,
-          width: widthPt,
-          height: heightPt,
-          rotationDeg,
+          jobs,
           outputDir,
           skipIndices: skipIndices.length > 0 ? skipIndices : undefined,
         });
@@ -192,10 +205,7 @@ export function StampControls(): React.JSX.Element {
         setExporting(false);
       }
     },
-    [
-      files, stampType, imagePath, text, fontSize, fontName, color,
-      xPt, yPt, widthPt, heightPt, rotationDeg, setExporting, setExportProgress,
-    ],
+    [files, getEffectiveConfig, setExporting, setExportProgress],
   );
 
   const handleApplyAll = useCallback(async () => {
