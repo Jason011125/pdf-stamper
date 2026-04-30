@@ -42,3 +42,17 @@ Environment: Linux devcontainer (.devcontainer/)
 (Ralph appends one block per completed story below.)
 
 ---
+
+## 2026-04-30 — US-002a
+- Added `pdf::check_output_conflicts(input_paths, output_dir, suffix) -> Vec<ConflictEntry>` plus a small helper `pdf::compute_output_path` and the `pdf::STAMP_SUFFIX = "-stamped"` constant.
+- Refactored `commands::stamp_pdfs`'s per-file loop into `pdf::stamp_paths_to_disk(paths, skip_indices, output_dir, suffix, stamp_fn)` so the skip-list semantics are unit-testable without Tauri/pdfium.
+- Exposed `commands::check_output_conflicts` as a Tauri command and registered it in `lib.rs`.
+- `commands::stamp_pdfs` gained an optional `skip_indices: Option<Vec<usize>>` argument; when omitted/empty, behavior is unchanged.
+- Tests: 4 new in `pdf::tests` (compute_output_path, conflict-found, no-conflict, skip-respected, empty-skip-preserves-behavior). All 29 pdf tests pass; pdfium-backed property tests untouched.
+- Files changed: `src-tauri/src/pdf.rs`, `src-tauri/src/commands.rs`, `src-tauri/src/lib.rs`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`.
+- **Learnings**:
+  - Tauri arg-name camelCase auto-conversion: Rust param `skip_indices` is invoked from JS as `skipIndices`. Frontend bridge (US-002b) must use that exact spelling.
+  - When a Tauri command's response struct field is `output_path`, the JS side receives it as `output_path` (snake_case is preserved for Serialize unless the struct has `#[serde(rename_all = "camelCase")]`). PdfInfo uses snake_case in TS, so I matched that convention rather than introducing camelCase.
+  - To extract testable batch-loop code from a Tauri command, accept a `FnMut(idx, &[u8]) -> Result<Vec<u8>, PdfError>` closure. Tests pass a no-op stamp_fn that just appends a marker, which avoids loading pdfium for skip-list assertions.
+  - No `tempfile` crate in this repo. For tempdir-based tests, used a manual `make_tempdir(label)` helper that builds a unique dir under `std::env::temp_dir()` keyed by pid + nanos. Cheap, no new deps.
+---

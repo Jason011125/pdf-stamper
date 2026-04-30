@@ -14,8 +14,8 @@
         "cd src-tauri && cargo test passes."
       ],
       "priority": 1,
-      "passes": false,
-      "notes": ""
+      "passes": true,
+      "notes": "stamp_pdfs Tauri arg is skipIndices (camelCase, Option<Vec<usize>>). check_output_conflicts returns Vec<{idx, output_path}> (snake_case, like PdfInfo). Suffix constant is pdf::STAMP_SUFFIX = \"-stamped\". Loop logic refactored into pdf::stamp_paths_to_disk for testability."
     },
     {
       "id": "US-002b",

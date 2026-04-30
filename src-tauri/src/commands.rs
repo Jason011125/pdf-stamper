@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Serialize)]
 pub struct PdfInfo {
@@ -6,6 +6,11 @@ pub struct PdfInfo {
     pub filename: String,
     pub width_pt: f32,
     pub height_pt: f32,
+}
+
+#[derive(Deserialize)]
+pub struct ConflictInput {
+    pub path: String,
 }
 
 #[tauri::command]
@@ -45,6 +50,16 @@ pub async fn read_file_bytes(path: String) -> Result<Vec<u8>, String> {
     std::fs::read(&path).map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+pub async fn check_output_conflicts(
+    inputs: Vec<ConflictInput>,
+    output_dir: String,
+    suffix: String,
+) -> Result<Vec<crate::pdf::ConflictEntry>, String> {
+    let paths: Vec<String> = inputs.into_iter().map(|i| i.path).collect();
+    Ok(crate::pdf::check_output_conflicts(&paths, &output_dir, &suffix))
+}
+
 #[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn stamp_pdfs(
@@ -60,47 +75,39 @@ pub async fn stamp_pdfs(
     width: f32,
     height: f32,
     output_dir: String,
+    skip_indices: Option<Vec<usize>>,
 ) -> Result<Vec<String>, String> {
     let image_data = match image_path {
         Some(ref p) => Some(std::fs::read(p).map_err(|e| e.to_string())?),
         None => None,
     };
 
-    let mut output_paths = Vec::new();
+    let skip = skip_indices.unwrap_or_default();
+    let txt = text.unwrap_or_else(|| "STAMP".to_string());
+    let size = font_size.unwrap_or(24.0);
+    let font = font_name.unwrap_or_else(|| "Helvetica".to_string());
+    let rgb = color.as_deref().and_then(crate::pdf::parse_hex_color);
 
-    for path in &paths {
-        let pdf_bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-
-        let stamped = match stamp_type.as_str() {
+    crate::pdf::stamp_paths_to_disk(
+        &paths,
+        &skip,
+        &output_dir,
+        crate::pdf::STAMP_SUFFIX,
+        |_idx, pdf_bytes| match stamp_type.as_str() {
             "image" => {
                 let img = image_data
                     .as_ref()
-                    .ok_or("No image data provided")?;
-                crate::pdf::stamp_image(&pdf_bytes, img, x, y, width, height)
-                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| crate::pdf::PdfError::StampError(
+                        "No image data provided".into(),
+                    ))?;
+                crate::pdf::stamp_image(pdf_bytes, img, x, y, width, height)
             }
-            "text" => {
-                let txt = text.as_deref().unwrap_or("STAMP");
-                let size = font_size.unwrap_or(24.0);
-                let font = font_name.as_deref().unwrap_or("Helvetica");
-                let rgb = color
-                    .as_deref()
-                    .and_then(crate::pdf::parse_hex_color);
-                crate::pdf::stamp_text(&pdf_bytes, txt, x, y, size, font, rgb)
-                    .map_err(|e| e.to_string())?
-            }
-            _ => return Err(format!("Unknown stamp type: {}", stamp_type)),
-        };
-
-        let original_name = std::path::Path::new(path)
-            .file_stem()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "output".into());
-
-        let output_path = format!("{}/{}-stamped.pdf", output_dir, original_name);
-        std::fs::write(&output_path, &stamped).map_err(|e| e.to_string())?;
-        output_paths.push(output_path);
-    }
-
-    Ok(output_paths)
+            "text" => crate::pdf::stamp_text(pdf_bytes, &txt, x, y, size, &font, rgb),
+            other => Err(crate::pdf::PdfError::StampError(format!(
+                "Unknown stamp type: {}",
+                other
+            ))),
+        },
+    )
+    .map_err(|e| e.to_string())
 }

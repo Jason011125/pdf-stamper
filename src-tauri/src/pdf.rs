@@ -2,7 +2,11 @@ use image::GenericImageView;
 use lopdf::content::{Content, Operation};
 use lopdf::Object::Name;
 use lopdf::{Dictionary, Document, Object, Stream};
+use serde::Serialize;
 use thiserror::Error;
+
+/// Suffix appended to a PDF's file stem when computing its stamped output path.
+pub const STAMP_SUFFIX: &str = "-stamped";
 
 #[derive(Error, Debug)]
 pub enum PdfError {
@@ -14,6 +18,76 @@ pub enum PdfError {
     StampError(String),
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct ConflictEntry {
+    pub idx: usize,
+    pub output_path: String,
+}
+
+/// Compute the stamped-output path for a single input PDF, mirroring the
+/// naming used by `stamp_pdfs` (input stem + suffix + ".pdf", under
+/// `output_dir`). Kept pure / no I/O so it's trivially testable.
+pub fn compute_output_path(input_path: &str, output_dir: &str, suffix: &str) -> String {
+    let stem = std::path::Path::new(input_path)
+        .file_stem()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "output".into());
+    format!("{}/{}{}.pdf", output_dir, stem, suffix)
+}
+
+/// Return the indices and output paths of inputs whose computed output path
+/// already exists on disk. The frontend uses this to surface a per-file
+/// overwrite/skip prompt before kicking off the actual batch.
+pub fn check_output_conflicts(
+    input_paths: &[String],
+    output_dir: &str,
+    suffix: &str,
+) -> Vec<ConflictEntry> {
+    input_paths
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, p)| {
+            let output_path = compute_output_path(p, output_dir, suffix);
+            if std::path::Path::new(&output_path).exists() {
+                Some(ConflictEntry { idx, output_path })
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Iterate `paths`, skipping any whose index is in `skip_indices`, applying
+/// `stamp_fn` to the bytes of each surviving file, and writing the result to
+/// `output_dir/<stem><suffix>.pdf`. Returns the list of written output paths.
+///
+/// Extracted from `commands::stamp_pdfs` so the skip-list semantics are
+/// testable without spinning up Tauri.
+pub fn stamp_paths_to_disk<F>(
+    paths: &[String],
+    skip_indices: &[usize],
+    output_dir: &str,
+    suffix: &str,
+    mut stamp_fn: F,
+) -> Result<Vec<String>, PdfError>
+where
+    F: FnMut(usize, &[u8]) -> Result<Vec<u8>, PdfError>,
+{
+    let skip_set: std::collections::HashSet<usize> = skip_indices.iter().copied().collect();
+    let mut output_paths = Vec::new();
+    for (idx, path) in paths.iter().enumerate() {
+        if skip_set.contains(&idx) {
+            continue;
+        }
+        let pdf_bytes = std::fs::read(path)?;
+        let stamped = stamp_fn(idx, &pdf_bytes)?;
+        let out = compute_output_path(path, output_dir, suffix);
+        std::fs::write(&out, &stamped)?;
+        output_paths.push(out);
+    }
+    Ok(output_paths)
 }
 
 /// Parse a PDF object as f32, handling both Real and Integer types.
@@ -1723,5 +1797,141 @@ mod tests {
             }
         }
         panic!("Stamp Form XObject not found");
+    }
+
+    // -- Tests: check_output_conflicts + stamp_paths_to_disk -----------------
+
+    /// Create a unique temp subdirectory for a test, removing any prior
+    /// instance. Avoids needing the `tempfile` crate as a dev-dependency.
+    fn make_tempdir(label: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "pdf-stamper-test-{}-{}-{}",
+            label,
+            std::process::id(),
+            nanos,
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn compute_output_path_uses_stem_and_suffix() {
+        let p = compute_output_path("/some/dir/example.pdf", "/out", "-stamped");
+        assert_eq!(p, "/out/example-stamped.pdf");
+    }
+
+    #[test]
+    fn check_output_conflicts_reports_only_existing_files() {
+        let out_dir = make_tempdir("conflicts");
+
+        // Two inputs: one whose output will already exist, one that won't.
+        let inputs = vec![
+            "/anywhere/alpha.pdf".to_string(),
+            "/anywhere/beta.pdf".to_string(),
+            "/anywhere/gamma.pdf".to_string(),
+        ];
+
+        // Pre-create alpha-stamped.pdf and gamma-stamped.pdf in out_dir.
+        std::fs::write(out_dir.join("alpha-stamped.pdf"), b"existing").unwrap();
+        std::fs::write(out_dir.join("gamma-stamped.pdf"), b"existing").unwrap();
+
+        let conflicts =
+            check_output_conflicts(&inputs, out_dir.to_str().unwrap(), STAMP_SUFFIX);
+
+        assert_eq!(conflicts.len(), 2);
+        assert_eq!(conflicts[0].idx, 0);
+        assert!(conflicts[0].output_path.ends_with("alpha-stamped.pdf"));
+        assert_eq!(conflicts[1].idx, 2);
+        assert!(conflicts[1].output_path.ends_with("gamma-stamped.pdf"));
+
+        let _ = std::fs::remove_dir_all(&out_dir);
+    }
+
+    #[test]
+    fn check_output_conflicts_returns_empty_when_no_conflicts() {
+        let out_dir = make_tempdir("noconflicts");
+        let inputs = vec!["/anywhere/lonely.pdf".to_string()];
+        let conflicts =
+            check_output_conflicts(&inputs, out_dir.to_str().unwrap(), STAMP_SUFFIX);
+        assert!(conflicts.is_empty());
+        let _ = std::fs::remove_dir_all(&out_dir);
+    }
+
+    #[test]
+    fn stamp_paths_to_disk_skips_indices() {
+        let in_dir = make_tempdir("stamp-in");
+        let out_dir = make_tempdir("stamp-out");
+
+        // Three input "PDFs" (just byte blobs — the stamp_fn here is a no-op).
+        let names = ["one", "two", "three"];
+        let mut input_paths = Vec::new();
+        for n in &names {
+            let p = in_dir.join(format!("{}.pdf", n));
+            std::fs::write(&p, format!("INPUT-{}", n).as_bytes()).unwrap();
+            input_paths.push(p.to_str().unwrap().to_string());
+        }
+
+        let mut seen_indices: Vec<usize> = Vec::new();
+        let written = stamp_paths_to_disk(
+            &input_paths,
+            &[1],
+            out_dir.to_str().unwrap(),
+            STAMP_SUFFIX,
+            |idx, bytes| {
+                seen_indices.push(idx);
+                let mut v = bytes.to_vec();
+                v.extend_from_slice(b"-STAMPED");
+                Ok(v)
+            },
+        )
+        .unwrap();
+
+        // Only indices 0 and 2 should have been processed/written.
+        assert_eq!(seen_indices, vec![0, 2]);
+        assert_eq!(written.len(), 2);
+        assert!(written[0].ends_with("one-stamped.pdf"));
+        assert!(written[1].ends_with("three-stamped.pdf"));
+
+        // Outputs exist on disk.
+        assert!(out_dir.join("one-stamped.pdf").exists());
+        assert!(out_dir.join("three-stamped.pdf").exists());
+        assert!(!out_dir.join("two-stamped.pdf").exists());
+
+        // Verify the no-op stamper was actually applied.
+        let body = std::fs::read(out_dir.join("one-stamped.pdf")).unwrap();
+        assert_eq!(body, b"INPUT-one-STAMPED");
+
+        let _ = std::fs::remove_dir_all(&in_dir);
+        let _ = std::fs::remove_dir_all(&out_dir);
+    }
+
+    #[test]
+    fn stamp_paths_to_disk_empty_skip_preserves_existing_behavior() {
+        let in_dir = make_tempdir("stamp-noskip-in");
+        let out_dir = make_tempdir("stamp-noskip-out");
+
+        let p = in_dir.join("doc.pdf");
+        std::fs::write(&p, b"INPUT").unwrap();
+        let input_paths = vec![p.to_str().unwrap().to_string()];
+
+        let written = stamp_paths_to_disk(
+            &input_paths,
+            &[],
+            out_dir.to_str().unwrap(),
+            STAMP_SUFFIX,
+            |_idx, bytes| Ok(bytes.to_vec()),
+        )
+        .unwrap();
+
+        assert_eq!(written.len(), 1);
+        assert!(written[0].ends_with("doc-stamped.pdf"));
+
+        let _ = std::fs::remove_dir_all(&in_dir);
+        let _ = std::fs::remove_dir_all(&out_dir);
     }
 }
