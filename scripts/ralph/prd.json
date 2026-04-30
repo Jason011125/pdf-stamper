@@ -1,0 +1,136 @@
+{
+  "branchName": "ralph/feature-wave-1",
+  "userStories": [
+    {
+      "id": "US-002a",
+      "title": "Rust: check_output_conflicts command + stamp_pdfs supports skip list",
+      "description": "Add a Tauri command that returns which output paths already exist for a planned batch. Modify stamp_pdfs to accept skip_indices: Vec<usize> so the frontend can skip files for which the user picked 'cancel' in the conflict dialog.",
+      "acceptanceCriteria": [
+        "New function check_output_conflicts(inputs: Vec<{path}>, output_dir: String, suffix: String) -> Vec<{idx: usize, output_path: String}>; returns one entry per input whose computed output path already exists.",
+        "Exposed as Tauri command in src-tauri/src/commands.rs.",
+        "stamp_pdfs accepts an additional argument skip_indices: Vec<usize>; those input indices are skipped (no file written).",
+        "Existing behavior preserved when skip_indices is empty.",
+        "Unit tests in src-tauri/src/pdf.rs (mod tests): one for check_output_conflicts using a tempdir fixture with pre-existing colliding files; one verifying stamp_pdfs respects skip_indices.",
+        "cd src-tauri && cargo test passes."
+      ],
+      "priority": 1,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-002b",
+      "title": "Frontend bridge: wrap conflict commands + ConflictDecision type",
+      "description": "Add TypeScript wrappers for the new Rust command, define decision types, update the export wrapper signature.",
+      "acceptanceCriteria": [
+        "src/services/pdf-bridge.ts exports checkOutputConflicts(inputs, outputDir, suffix): Promise<Conflict[]> matching the Rust signature.",
+        "Define exported type ConflictDecision = 'overwrite' | 'skip'.",
+        "stampAllPdfs (or equivalent) signature updated to accept optional skipIndices: number[].",
+        "TS strict; npx tsc --noEmit passes.",
+        "Vitest test for the bridge that mocks @tauri-apps/api invoke and asserts checkOutputConflicts forwards args correctly and parses the response shape."
+      ],
+      "priority": 2,
+      "passes": false,
+      "notes": "Depends on US-002a's Rust command being merged."
+    },
+    {
+      "id": "US-002c",
+      "title": "Frontend UI: conflict dialog + 4-button state machine",
+      "description": "On Export, first call checkOutputConflicts. If conflicts exist, walk through them one at a time in a dialog with 4 buttons: 'Overwrite' (this file gets overwritten), 'Cancel' (skip this file), 'Overwrite all' (apply 'overwrite' to all remaining without asking), 'Cancel all' (skip all remaining). After collecting decisions, call stampAllPdfs with the resulting skip indices.",
+      "acceptanceCriteria": [
+        "New component src/components/conflict-dialog.tsx with the 4 buttons and clear conflict info (filename + output path).",
+        "State machine via useReducer: state = { currentIndex, decisions: ConflictDecision[], applyAllMode: 'overwrite'|'skip'|null }.",
+        "If applyAllMode is set, future conflicts auto-apply that decision (dialog does not show).",
+        "stamp-controls.tsx (or wherever export lives) calls checkOutputConflicts before stampAllPdfs and routes through the conflict dialog if needed.",
+        "Vitest tests for the state machine: simulate sequences like 'overwrite, cancel-all on 5 conflicts → decisions = [overwrite, skip, skip, skip, skip]'; cover all 4 buttons.",
+        "tsc --noEmit and vitest run pass.",
+        "Manual verify recipe in commit body: load 2 PDFs with the same filename in different dirs → click Export → expect dialog with 'Overwrite/Cancel/Overwrite all/Cancel all' buttons; verify each button's behavior."
+      ],
+      "priority": 3,
+      "passes": false,
+      "notes": "Depends on US-002a + US-002b."
+    },
+    {
+      "id": "US-R1",
+      "title": "Rust: cm matrix with user rotation around stamp center",
+      "description": "Compose a user-chosen rotation around the stamp's center into the existing cm matrix. The user picks position (xPt, yPt = bottom-left of the *unrotated* stamp), size (w, h), and angle (degrees, CCW). The rendered stamp must visibly rotate around its center.",
+      "acceptanceCriteria": [
+        "New (or extended) Rust function returning cm matrix [a,b,c,d,e,f] given (page_rotation, dx, dy, w, h, raw_w, raw_h, user_angle_deg).",
+        "Math: M_total = T_rotate^-1 · T(dx + w/2, dy + h/2) · R(user_angle) · T(-w/2, -h/2) · S(w, h).",
+        "Property tests in mod tests: for each page_rotation in {0,90,180,270} and user_angle in {0,30,90,145,180,270,359}, verify the 4 unit-square corners after applying cm + T_rotate land on the corners of a rectangle whose center is at (dx + w/2, dy + h/2) and which is rotated by user_angle around that center. Use parse_stamp_placement on a real stamped PDF, OR a direct cm composition assertion if more convenient.",
+        "cargo test passes.",
+        "Existing behavior with user_angle=0 must be byte-identical to current image_cm_for_rotation."
+      ],
+      "priority": 4,
+      "passes": false,
+      "notes": "Independent of US-002* — different code path. Touch pdf.rs production code is expected here (this is a feature, not a test refactor)."
+    },
+    {
+      "id": "US-R2",
+      "title": "Frontend: rotation UI + stamp-store rotationDeg",
+      "description": "Add rotationDeg field to stamp-store. Add a rotation input control in stamp-controls (number input or slider, 0–360, with reset-to-0 button). Apply CSS transform to the stamp overlay in preview-pane so the live preview reflects rotation. Pass rotation through stampAllPdfs to Rust.",
+      "acceptanceCriteria": [
+        "stamp-store.ts has rotationDeg: number with setter setRotationDeg(deg: number); deg is normalized to [0, 360).",
+        "stamp-controls.tsx renders a rotation input that updates the store and a reset button.",
+        "preview-pane.tsx applies CSS `transform: rotate(${rotationDeg}deg)` to the stamp overlay with `transform-origin: center`.",
+        "pdf-bridge.ts stampAllPdfs forwards rotationDeg to the Rust command.",
+        "src-tauri/src/commands.rs accepts the rotation arg (extend StampConfig if needed) and passes it to the new cm function from US-R1.",
+        "Vitest: store updates work; preview-pane applies the correct transform string for various rotationDeg values.",
+        "tsc --noEmit and vitest run pass.",
+        "Manual verify recipe in commit body: open 1 PDF, drag stamp, change rotation slider → live preview rotates; export → rendered PDF stamp matches the rotation."
+      ],
+      "priority": 5,
+      "passes": false,
+      "notes": "Depends on US-R1's Rust function."
+    },
+    {
+      "id": "US-P1",
+      "title": "Stamp store refactor: global default + per-pdf overrides (model A)",
+      "description": "Refactor stamp-store from a single global config to: { defaultConfig, overrides: Record<pdfId, Partial<StampConfig>> }. Add selector getEffectiveConfig(pdfId) returning default merged with override (override fields take precedence). Add actions setDefault(partial) and setOverride(pdfId, partial) and clearOverride(pdfId).",
+      "acceptanceCriteria": [
+        "stamp-store.ts new shape: defaultConfig + overrides map keyed by pdfId (use the existing pdf identifier — likely path or a synthesized id).",
+        "Selector getEffectiveConfig(pdfId) — fields not in override fall through to default.",
+        "Action setOverride(pdfId, partial) — shallow-merges into existing override entry.",
+        "Action clearOverride(pdfId) — removes that PDF's override entry.",
+        "Action setDefault(partial) — shallow-merges into default. Does NOT touch overrides.",
+        "Vitest covers 5 invariants of model A: (1) default exists from start, (2) override never modifies default, (3) changing default affects all PDFs without an override, (4) PDF with override stays put when default changes, (5) clearing override returns that PDF to default.",
+        "tsc --noEmit and vitest run pass.",
+        "This story does NOT yet wire the new shape into UI components — that's US-P2. Existing components may need a tiny shim (e.g., calling getEffectiveConfig with a fixed id) to keep compiling. Acceptable."
+      ],
+      "priority": 6,
+      "passes": false,
+      "notes": "Pure store refactor + invariant tests."
+    },
+    {
+      "id": "US-P2",
+      "title": "UI: per-PDF effective config + override-on-edit",
+      "description": "Wire UI components to read via getEffectiveConfig(currentPdfId) instead of a single config. When the user adjusts position/size/rotation on a specific PDF, write to overrides (NOT default). Switching PDFs in the file list shows that PDF's effective config (which may inherit from default).",
+      "acceptanceCriteria": [
+        "preview-pane.tsx and stamp-controls.tsx read via getEffectiveConfig(currentPdfId).",
+        "All position/size/rotation edits in those components become setOverride calls scoped to currentPdfId. There must be NO setDefault calls from UI handlers (the only setDefault call site is the initial bootstrap when the user first picks a position before any PDF-specific override exists; document this in CLAUDE.md or progress.txt).",
+        "Vitest: simulate 5 mock PDFs. (a) After the user sets a position on PDF 0, all 5 effective configs match (because none have an override yet — note: this implies the *first* edit goes to default; subsequent edits on the same PDF go to its override). (b) Adjust on PDF 2 → only PDF 2 shifts. (c) Adjust default again → PDFs 0,1,3,4 follow but 2 stays.",
+        "tsc --noEmit and vitest run pass.",
+        "Manual verify recipe in commit body."
+      ],
+      "priority": 7,
+      "passes": false,
+      "notes": "Depends on US-P1. The 'first edit writes default, subsequent edits write override' rule is the trickiest UX bit; document it clearly."
+    },
+    {
+      "id": "US-P3",
+      "title": "stamp_pdfs accepts per-PDF configs",
+      "description": "Currently stamp_pdfs takes one set of position/size/rotation and applies them to all PDFs. Change it to accept an array of per-PDF configs. The frontend assembles configs by computing getEffectiveConfig for every loaded PDF before invoking.",
+      "acceptanceCriteria": [
+        "Rust commands::stamp_pdfs signature accepts Vec<StampJob> where StampJob = {path, x, y, w, h, rotation_deg, ...stamp content fields}.",
+        "pdf::stamp_pdfs (the impl) loops over the configs, calling stamp_image (or stamp_text) per file with that file's params.",
+        "pdf-bridge.ts stampAllPdfs accepts a Map<pdfId, StampConfig> (or equivalent) plus the existing skipIndices.",
+        "stamp-controls.tsx Export handler iterates loaded PDFs, computes effective config per file, passes the assembled list to stampAllPdfs.",
+        "cargo test: extend stamp_pdfs unit test to verify per-file config — use parse_stamp_placement on each output PDF to confirm its stamp lands at THAT file's specified (x, y, rotation).",
+        "tsc --noEmit, vitest run, and cargo test pass.",
+        "Manual verify recipe in commit body: load 5 PDFs, set distinct positions and rotations on each, export, open all 5 in a viewer, confirm each is correct."
+      ],
+      "priority": 8,
+      "passes": false,
+      "notes": "Depends on US-P1, US-P2, US-R1."
+    }
+  ]
+}

@@ -1,0 +1,44 @@
+# Ralph Progress Log
+
+Started: 2026-04-30
+Repo: pdf-stamper (Tauri v2 + React 19 + TypeScript + Rust)
+Branch: ralph/feature-wave-1
+Environment: Linux devcontainer (.devcontainer/)
+
+## Codebase Patterns
+
+(Ralph: append new patterns to the BOTTOM of this section as you discover them.)
+
+- **PDF cm matrix is the most error-prone code in this repo.** Always verify with property tests via `parse_stamp_placement` (in `src-tauri/src/pdf.rs` mod tests). Pure-arithmetic unit tests aren't enough — they encode the same wrong derivation as the broken code (see `.claude/CLAUDE.md` "Why pure-arithmetic unit tests aren't enough"). Reference: commit 1622433 (image_cm fix) and 9f2b85b (test refactor).
+
+- **Two coordinate systems**: PDF content stream is in *raw* page space (origin bottom-left, Y up, points). The viewer applies `/Rotate` to produce *display* space. The user picks positions in display space; we store as `(xPt, yPt, w, h)` in display units; cm matrix maps unit-square → raw space. See `.claude/CLAUDE.md` "Coordinate System" + "PDF Image Stamp `cm` Matrix Recipe".
+
+- **q/Q wrapping rule**: when adding stamp content to an existing page Contents stream, wrap the existing Contents in `q ... Q` first; otherwise polluted CTM from the original PDF leaks into the stamp. Already implemented in `append_content_stream` (commit e633776). Regression covered by `stamp_image_survives_polluted_ctm_in_existing_contents`.
+
+- **PDF Image XObject unit-square mapping (PDF 1.7 §8.9.5)**: an Image XObject is drawn into the unit square (0,0)–(1,1) with the *first* sample at unit (0,1) and the *last* sample at unit (1,0). PDF already accounts for top-down storage vs bottom-up user space — do NOT add a manual Y flip. Minimal "draw upright at (x,y) size (w,h)" cm = `[w, 0, 0, h, x, y]`. Anything with negative `d` is suspicious.
+
+- **Tauri 2 IPC pattern**: prefer frontend-driven flows. Tauri lets Rust emit events, but receiving a synchronous response from the frontend is awkward. For multi-step user decisions (e.g. conflict resolution), have the frontend pre-fetch info via a separate command, decide entirely in React, then invoke the executing command with all decisions baked in.
+
+- **Frontend layout**: Zustand stores in `src/stores/`, IPC wrappers in `src/services/`, components in `src/components/`. One component per file. kebab-case filenames. Strict TS, no `any`, no `console.log` in production code.
+
+## Key Files
+
+- `src-tauri/src/pdf.rs` — all PDF logic (~1700 lines). Production code at the top, `mod tests` at the bottom (around line 700+).
+- `src-tauri/src/commands.rs` — Tauri command handlers, thin, delegate to pdf.rs.
+- `src/stores/{pdf-store,stamp-store}.ts` — Zustand stores.
+- `src/services/pdf-bridge.ts` — Tauri invoke wrappers.
+- `src/components/{file-list,preview-pane,stamp-controls}.tsx`.
+- `.claude/CLAUDE.md` — extensive project guide; read before changing pdf.rs.
+
+## Build & Test (run from repo root)
+
+- `cd src-tauri && cargo test` — Rust + pdfium unit tests
+- `npx tsc --noEmit` — TS type check
+- `npx vitest run` — frontend unit tests
+- DO NOT run `npm run tauri dev` / `tauri build` in the devcontainer — no webkit2gtk; will fail.
+
+## Iteration Log
+
+(Ralph appends one block per completed story below.)
+
+---
