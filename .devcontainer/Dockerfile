@@ -4,15 +4,20 @@ ARG TZ=UTC
 ENV TZ="$TZ" \
     DEBIAN_FRONTEND=noninteractive
 
-# System packages: build toolchain, network tools for the firewall script,
-# and a few QoL utilities. Tauri GUI deps (webkit2gtk, libgtk-3) are
-# intentionally omitted — Ralph only runs cargo test / tsc / vitest in
-# this container, never `tauri dev`.
+# System packages:
+#   - Standard build toolchain (gcc/make/pkg-config/openssl) and QoL utils.
+#   - Network tools (iptables/ipset/dnsutils) for the firewall init script.
+#   - Tauri 2 Linux build deps (gtk-3, webkit2gtk-4.1, etc.). These are
+#     required at *compile* time even though Ralph never runs `tauri dev`
+#     — `cargo test` for src-tauri links against tauri crates which
+#     transitively pull in gdk-sys / webkit2gtk-sys / soup3-sys. Without
+#     these dev libs `cargo test` fails with "system library X not found".
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         ca-certificates \
         curl \
         dnsutils \
+        file \
         git \
         gnupg2 \
         iproute2 \
@@ -20,12 +25,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         iptables \
         jq \
         less \
+        libayatana-appindicator3-dev \
+        libgtk-3-dev \
+        librsvg2-dev \
         libssl-dev \
+        libwebkit2gtk-4.1-dev \
+        libxdo-dev \
         pkg-config \
         procps \
         sudo \
         unzip \
         vim \
+        wget \
     && rm -rf /var/lib/apt/lists/*
 
 # Allow the existing `node` user (UID 1000) to run iptables/ipset without
