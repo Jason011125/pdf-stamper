@@ -4,6 +4,12 @@ ARG TZ=UTC
 ENV TZ="$TZ" \
     DEBIAN_FRONTEND=noninteractive
 
+# Switch apt to a Chinese mirror. The default deb.debian.org sometimes
+# resolves to the RFC 2544 test address 198.18.1.113 on hosts running
+# certain VPNs or DNS filters, which silently breaks `apt-get update`.
+# Aliyun's mirror is reliable from APAC and a good general default.
+RUN sed -i 's|http://deb.debian.org|http://mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources
+
 # System packages:
 #   - Standard build toolchain (gcc/make/pkg-config/openssl) and QoL utils.
 #   - Network tools (iptables/ipset/dnsutils) for the firewall init script.
