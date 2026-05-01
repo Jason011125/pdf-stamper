@@ -5,7 +5,8 @@
   "workspaceFolder": "/workspace",
   "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached",
   "mounts": [
-    "source=${localEnv:HOME}/.claude,target=/home/node/.claude,type=bind,consistency=cached"
+    "source=${localEnv:HOME}/.claude,target=/home/node/.claude,type=bind,consistency=cached",
+    "source=pdf-stamper-node-modules,target=/workspace/node_modules,type=volume"
   ],
   "runArgs": [
     "--cap-add=NET_ADMIN",

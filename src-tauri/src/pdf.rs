@@ -2,7 +2,11 @@ use image::GenericImageView;
 use lopdf::content::{Content, Operation};
 use lopdf::Object::Name;
 use lopdf::{Dictionary, Document, Object, Stream};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+/// Suffix appended to a PDF's file stem when computing its stamped output path.
+pub const STAMP_SUFFIX: &str = "-stamped";
 
 #[derive(Error, Debug)]
 pub enum PdfError {
@@ -14,6 +18,150 @@ pub enum PdfError {
     StampError(String),
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct ConflictEntry {
+    pub idx: usize,
+    pub output_path: String,
+}
+
+/// Compute the stamped-output path for a single input PDF, mirroring the
+/// naming used by `stamp_pdfs` (input stem + suffix + ".pdf", under
+/// `output_dir`). Kept pure / no I/O so it's trivially testable.
+pub fn compute_output_path(input_path: &str, output_dir: &str, suffix: &str) -> String {
+    let stem = std::path::Path::new(input_path)
+        .file_stem()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "output".into());
+    format!("{}/{}{}.pdf", output_dir, stem, suffix)
+}
+
+/// Return the indices and output paths of inputs whose computed output path
+/// already exists on disk. The frontend uses this to surface a per-file
+/// overwrite/skip prompt before kicking off the actual batch.
+pub fn check_output_conflicts(
+    input_paths: &[String],
+    output_dir: &str,
+    suffix: &str,
+) -> Vec<ConflictEntry> {
+    input_paths
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, p)| {
+            let output_path = compute_output_path(p, output_dir, suffix);
+            if std::path::Path::new(&output_path).exists() {
+                Some(ConflictEntry { idx, output_path })
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// One PDF's complete stamp configuration. Carried over IPC from the frontend
+/// (`StampConfig` for a single PDF, materialized via `getEffectiveConfig`).
+/// Stamp content fields (image_path, text, ...) are per-job for symmetry with
+/// `StampConfig`, even though today's UI keeps stamp content global across
+/// loaded PDFs — only position/size/rotation actually vary per file.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct StampJob {
+    pub path: String,
+    pub stamp_type: String,
+    pub image_path: Option<String>,
+    pub text: Option<String>,
+    pub font_size: Option<f32>,
+    pub font_name: Option<String>,
+    pub color: Option<String>,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub rotation_deg: Option<f32>,
+}
+
+/// Run a batch of per-PDF stamp jobs to disk. Reads each distinct image
+/// once (cached by path), then applies the per-job stamp_image / stamp_text
+/// to each input, writing each output to `output_dir/<stem><suffix>.pdf`.
+/// Indices in `skip_indices` are skipped (no file written for those jobs).
+///
+/// This is the non-async core of `commands::stamp_pdfs`; the Tauri handler
+/// is a thin wrapper. Lives here so the per-job dispatch + caching can be
+/// covered by a real-PDF integration test that loads pdfium directly.
+pub fn run_stamp_jobs(
+    jobs: &[StampJob],
+    output_dir: &str,
+    skip_indices: &[usize],
+) -> Result<Vec<String>, PdfError> {
+    let mut image_cache: std::collections::HashMap<String, Vec<u8>> =
+        std::collections::HashMap::new();
+    for job in jobs {
+        if job.stamp_type == "image" {
+            if let Some(p) = &job.image_path {
+                if !image_cache.contains_key(p) {
+                    let bytes = std::fs::read(p)?;
+                    image_cache.insert(p.clone(), bytes);
+                }
+            }
+        }
+    }
+
+    let paths: Vec<String> = jobs.iter().map(|j| j.path.clone()).collect();
+
+    stamp_paths_to_disk(&paths, skip_indices, output_dir, STAMP_SUFFIX, |idx, pdf_bytes| {
+        let job = &jobs[idx];
+        let rot = job.rotation_deg.unwrap_or(0.0);
+        match job.stamp_type.as_str() {
+            "image" => {
+                let img = job
+                    .image_path
+                    .as_deref()
+                    .and_then(|p| image_cache.get(p))
+                    .ok_or_else(|| PdfError::StampError("No image data provided".into()))?;
+                stamp_image(pdf_bytes, img, job.x, job.y, job.width, job.height, rot)
+            }
+            "text" => {
+                let txt = job.text.as_deref().unwrap_or("STAMP");
+                let size = job.font_size.unwrap_or(24.0);
+                let font = job.font_name.as_deref().unwrap_or("Helvetica");
+                let rgb = job.color.as_deref().and_then(parse_hex_color);
+                stamp_text(pdf_bytes, txt, job.x, job.y, size, font, rgb)
+            }
+            other => Err(PdfError::StampError(format!("Unknown stamp type: {}", other))),
+        }
+    })
+}
+
+/// Iterate `paths`, skipping any whose index is in `skip_indices`, applying
+/// `stamp_fn` to the bytes of each surviving file, and writing the result to
+/// `output_dir/<stem><suffix>.pdf`. Returns the list of written output paths.
+///
+/// Extracted from `commands::stamp_pdfs` so the skip-list semantics are
+/// testable without spinning up Tauri.
+pub fn stamp_paths_to_disk<F>(
+    paths: &[String],
+    skip_indices: &[usize],
+    output_dir: &str,
+    suffix: &str,
+    mut stamp_fn: F,
+) -> Result<Vec<String>, PdfError>
+where
+    F: FnMut(usize, &[u8]) -> Result<Vec<u8>, PdfError>,
+{
+    let skip_set: std::collections::HashSet<usize> = skip_indices.iter().copied().collect();
+    let mut output_paths = Vec::new();
+    for (idx, path) in paths.iter().enumerate() {
+        if skip_set.contains(&idx) {
+            continue;
+        }
+        let pdf_bytes = std::fs::read(path)?;
+        let stamped = stamp_fn(idx, &pdf_bytes)?;
+        let out = compute_output_path(path, output_dir, suffix);
+        std::fs::write(&out, &stamped)?;
+        output_paths.push(out);
+    }
+    Ok(output_paths)
 }
 
 /// Parse a PDF object as f32, handling both Real and Integer types.
@@ -183,34 +331,87 @@ pub fn render_page_to_png(pdf_bytes: &[u8], target_width: u16) -> Result<Vec<u8>
     Ok(png_bytes)
 }
 
+// 2D affine matrix in PDF cm form: [a, b, c, d, e, f] representing the
+// affine map (x, y) → (a*x + c*y + e, b*x + d*y + f).
+type Affine = [f32; 6];
+
+const AFFINE_IDENTITY: Affine = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+
+/// Compose two affine maps: result(p) = a(b(p)).
+fn affine_mul(a: Affine, b: Affine) -> Affine {
+    [
+        a[0] * b[0] + a[2] * b[1],
+        a[1] * b[0] + a[3] * b[1],
+        a[0] * b[2] + a[2] * b[3],
+        a[1] * b[2] + a[3] * b[3],
+        a[0] * b[4] + a[2] * b[5] + a[4],
+        a[1] * b[4] + a[3] * b[5] + a[5],
+    ]
+}
+
+fn affine_translate(tx: f32, ty: f32) -> Affine {
+    [1.0, 0.0, 0.0, 1.0, tx, ty]
+}
+
+fn affine_scale(sx: f32, sy: f32) -> Affine {
+    [sx, 0.0, 0.0, sy, 0.0, 0.0]
+}
+
+/// CCW rotation by `deg` degrees around the origin.
+fn affine_rotate_deg(deg: f32) -> Affine {
+    let rad = deg.to_radians();
+    let (cs, sn) = (rad.cos(), rad.sin());
+    [cs, sn, -sn, cs, 0.0, 0.0]
+}
+
+/// Inverse of the viewer's `T_rotate` (raw → display): maps display → raw.
+/// Identity for `/Rotate=0`.
+fn t_rotate_inverse(rotation: u32, raw_w: f32, raw_h: f32) -> Affine {
+    match rotation {
+        90  => [ 0.0,  1.0, -1.0,  0.0, raw_w, 0.0  ],
+        180 => [-1.0,  0.0,  0.0, -1.0, raw_w, raw_h],
+        270 => [ 0.0, -1.0,  1.0,  0.0, 0.0,   raw_h],
+        _   => AFFINE_IDENTITY,
+    }
+}
+
 /// Compute the `cm` matrix [a, b, c, d, e, f] for placing an image stamp at
-/// display position `(dx, dy)` with display size `(sw, sh)` on a page whose
-/// raw MediaBox is `(raw_w, raw_h)` and whose `/Rotate` is `rotation` degrees CW.
+/// display position `(dx, dy)` with display size `(sw, sh)`, optionally
+/// rotated by `user_angle_deg` (CCW) around the stamp's center, on a page
+/// whose raw MediaBox is `(raw_w, raw_h)` and whose `/Rotate` is `rotation`
+/// degrees CW.
 ///
 /// PDF Image XObject convention (PDF 1.7 §8.9.5): the source image's first
 /// sample (top-left) maps to unit-square (0, 1) and the last (bottom-right)
 /// to (1, 0). The minimal "upright at (x, y) sized (w, h)" matrix is therefore
 /// `[w, 0, 0, h, x, y]` — no Y flip.
 ///
-/// For rotated pages, the viewer applies `T_rotate` (raw → display) at render
-/// time; we compose `M_display→raw · M_image→display` so that, after the viewer
-/// rotates by `rotation`° CW, the stamp lands upright at display `(dx, dy)`.
+/// The full composition is
+///
+/// ```text
+///   M_total = T_rotate^-1 · T(dx + w/2, dy + h/2) · R(user_angle)
+///                         · T(-w/2, -h/2) · S(w, h)
+/// ```
+///
+/// so that a unit-square corner is first scaled to the stamp size, recentered
+/// at the origin, rotated, translated to the stamp's display position, and
+/// finally mapped from display coordinates back to raw coordinates that the
+/// viewer's `T_rotate` will undo.
 ///
 /// **Do not modify without re-verifying via the property-based tests** in this
-/// module (see `assert_stamp_corners_at_display`). The full derivation lives
-/// in `.claude/CLAUDE.md` under "PDF Image Stamp `cm` Matrix Recipe".
+/// module (see `assert_image_cm_lands_at_user_rotated`). The full derivation
+/// lives in `.claude/CLAUDE.md` under "PDF Image Stamp `cm` Matrix Recipe".
 fn image_cm_for_rotation(
     rotation: u32,
     dx: f32, dy: f32,
     sw: f32, sh: f32,
     raw_w: f32, raw_h: f32,
-) -> [f32; 6] {
-    match rotation {
-        90  => [0.0,  sw, -sh, 0.0, raw_w - dy, dx],
-        180 => [-sw, 0.0, 0.0, -sh, raw_w - dx, raw_h - dy],
-        270 => [0.0, -sw,  sh, 0.0, dy, raw_h - dx],
-        _   => [sw,  0.0, 0.0,  sh, dx, dy],
-    }
+    user_angle_deg: f32,
+) -> Affine {
+    let m = affine_mul(affine_translate(-sw / 2.0, -sh / 2.0), affine_scale(sw, sh));
+    let m = affine_mul(affine_rotate_deg(user_angle_deg), m);
+    let m = affine_mul(affine_translate(dx + sw / 2.0, dy + sh / 2.0), m);
+    affine_mul(t_rotate_inverse(rotation, raw_w, raw_h), m)
 }
 
 /// Compute the coordinate-space `cm` matrix used for text stamps. After
@@ -260,6 +461,7 @@ pub fn stamp_image(
     y: f32,
     width: f32,
     height: f32,
+    user_angle_deg: f32,
 ) -> Result<Vec<u8>, PdfError> {
     let mut doc = Document::load_mem(pdf_bytes)
         .map_err(|e| PdfError::StampError(e.to_string()))?;
@@ -279,7 +481,7 @@ pub fn stamp_image(
     // correct position and orientation in the displayed (rotated) page.
     let img_ref_name = b"Img0";
     let [a, b, c, d, e, f] = image_cm_for_rotation(
-        geo.rotation, x, y, width, height, geo.raw_width, geo.raw_height,
+        geo.rotation, x, y, width, height, geo.raw_width, geo.raw_height, user_angle_deg,
     );
     let form_ops = vec![
         Operation::new("q", vec![]),
@@ -1317,7 +1519,7 @@ mod tests {
     fn stamp_image_lands_at_display_no_rotation() {
         let pdf = make_test_pdf(612.0, 792.0, None);
         let img = make_red_png();
-        let stamped = stamp_image(&pdf, &img, 100.0, 200.0, 150.0, 75.0).unwrap();
+        let stamped = stamp_image(&pdf, &img, 100.0, 200.0, 150.0, 75.0, 0.0).unwrap();
         assert_stamp_renders_at_display(&stamped, 0, 612.0, 792.0, 100.0, 200.0, 150.0, 75.0);
     }
 
@@ -1325,7 +1527,7 @@ mod tests {
     fn stamp_image_lands_at_display_rotation_90() {
         let pdf = make_test_pdf(612.0, 792.0, Some(90));
         let img = make_red_png();
-        let stamped = stamp_image(&pdf, &img, 100.0, 200.0, 150.0, 75.0).unwrap();
+        let stamped = stamp_image(&pdf, &img, 100.0, 200.0, 150.0, 75.0, 0.0).unwrap();
         assert_stamp_renders_at_display(&stamped, 90, 612.0, 792.0, 100.0, 200.0, 150.0, 75.0);
     }
 
@@ -1333,7 +1535,7 @@ mod tests {
     fn stamp_image_lands_at_display_rotation_180() {
         let pdf = make_test_pdf(612.0, 792.0, Some(180));
         let img = make_red_png();
-        let stamped = stamp_image(&pdf, &img, 100.0, 200.0, 150.0, 75.0).unwrap();
+        let stamped = stamp_image(&pdf, &img, 100.0, 200.0, 150.0, 75.0, 0.0).unwrap();
         assert_stamp_renders_at_display(&stamped, 180, 612.0, 792.0, 100.0, 200.0, 150.0, 75.0);
     }
 
@@ -1341,7 +1543,7 @@ mod tests {
     fn stamp_image_lands_at_display_rotation_270() {
         let pdf = make_test_pdf(612.0, 792.0, Some(270));
         let img = make_red_png();
-        let stamped = stamp_image(&pdf, &img, 100.0, 200.0, 150.0, 75.0).unwrap();
+        let stamped = stamp_image(&pdf, &img, 100.0, 200.0, 150.0, 75.0, 0.0).unwrap();
         assert_stamp_renders_at_display(&stamped, 270, 612.0, 792.0, 100.0, 200.0, 150.0, 75.0);
     }
 
@@ -1350,8 +1552,111 @@ mod tests {
         // Non-square page: exercises matrices that only work for square pages.
         let pdf = make_test_pdf(1000.0, 400.0, Some(90));
         let img = make_red_png();
-        let stamped = stamp_image(&pdf, &img, 50.0, 30.0, 200.0, 80.0).unwrap();
+        let stamped = stamp_image(&pdf, &img, 50.0, 30.0, 200.0, 80.0, 0.0).unwrap();
         assert_stamp_renders_at_display(&stamped, 90, 1000.0, 400.0, 50.0, 30.0, 200.0, 80.0);
+    }
+
+    // -- Tests: image_cm_for_rotation with user-chosen rotation ------------
+    //
+    // These tests pin down the property we care about: a stamp drawn at
+    // display rectangle (dx, dy)..(dx+w, dy+h) and rotated by `user_angle`
+    // CCW around its center must, after the viewer applies `T_rotate`,
+    // land on the corners of that rotated rectangle. The test computes the
+    // expected corner positions geometrically (rotate-around-center) rather
+    // than re-encoding the same matrix derivation as the implementation.
+
+    /// Rotate `p` by `angle_deg` CCW around `c`.
+    fn rotate_around(p: (f32, f32), c: (f32, f32), angle_deg: f32) -> (f32, f32) {
+        let rad = angle_deg.to_radians();
+        let (cs, sn) = (rad.cos(), rad.sin());
+        let (dx, dy) = (p.0 - c.0, p.1 - c.1);
+        (c.0 + dx * cs - dy * sn, c.1 + dx * sn + dy * cs)
+    }
+
+    /// Verify that `image_cm_for_rotation` produces a matrix whose unit-square
+    /// corners, after `apply_cm` then `apply_t_rotate`, land on the corners of
+    /// the user-rotated display rectangle.
+    fn assert_image_cm_lands_at_user_rotated(
+        page_rotation: u32,
+        raw_w: f32, raw_h: f32,
+        dx: f32, dy: f32, w: f32, h: f32,
+        user_angle: f32,
+    ) {
+        let cm = image_cm_for_rotation(page_rotation, dx, dy, w, h, raw_w, raw_h, user_angle);
+        let center = (dx + w / 2.0, dy + h / 2.0);
+        let unrotated_corners: [((f32, f32), (f32, f32)); 4] = [
+            ((0.0, 0.0), (dx,     dy)),
+            ((1.0, 0.0), (dx + w, dy)),
+            ((0.0, 1.0), (dx,     dy + h)),
+            ((1.0, 1.0), (dx + w, dy + h)),
+        ];
+        for (unit, unrotated_disp) in unrotated_corners {
+            let raw = apply_cm(cm, unit);
+            let disp = apply_t_rotate(page_rotation, raw, raw_w, raw_h);
+            let expected = rotate_around(unrotated_disp, center, user_angle);
+            assert!(
+                (disp.0 - expected.0).abs() < 0.01 && (disp.1 - expected.1).abs() < 0.01,
+                "page_rotation={}, user_angle={}, unit={:?}: expected display {:?} got {:?}",
+                page_rotation, user_angle, unit, expected, disp,
+            );
+        }
+    }
+
+    #[test]
+    fn image_cm_user_rotation_property() {
+        // Cover all four page rotations crossed with several user angles
+        // (including 0 to confirm backward compatibility, and 359 to probe
+        // wraparound). raw_w != raw_h surfaces any matrix that mixes them.
+        let raw_w = 612.0_f32;
+        let raw_h = 792.0_f32;
+        let (dx, dy, w, h) = (100.0_f32, 200.0_f32, 150.0_f32, 75.0_f32);
+        for &page_rotation in &[0_u32, 90, 180, 270] {
+            for &user_angle in &[0.0_f32, 30.0, 90.0, 145.0, 180.0, 270.0, 359.0] {
+                assert_image_cm_lands_at_user_rotated(
+                    page_rotation, raw_w, raw_h, dx, dy, w, h, user_angle,
+                );
+            }
+        }
+    }
+
+    /// Byte-identity guard: with `user_angle_deg = 0.0`, the matrix produced
+    /// by `image_cm_for_rotation` must equal the previous closed-form
+    /// expression (which had no user-rotation parameter). Any future refactor
+    /// that breaks this is a regression.
+    #[test]
+    fn image_cm_user_rotation_zero_matches_legacy_matrices() {
+        let raw_w = 612.0_f32;
+        let raw_h = 792.0_f32;
+        let (dx, dy, sw, sh) = (100.0_f32, 200.0_f32, 150.0_f32, 75.0_f32);
+        let cases: [(u32, [f32; 6]); 4] = [
+            (0,   [sw,  0.0, 0.0,  sh, dx, dy]),
+            (90,  [0.0,  sw, -sh, 0.0, raw_w - dy, dx]),
+            (180, [-sw, 0.0, 0.0, -sh, raw_w - dx, raw_h - dy]),
+            (270, [0.0, -sw,  sh, 0.0, dy, raw_h - dx]),
+        ];
+        for (rot, expected) in cases {
+            let actual = image_cm_for_rotation(rot, dx, dy, sw, sh, raw_w, raw_h, 0.0);
+            for k in 0..6 {
+                assert!(
+                    (actual[k] - expected[k]).abs() < 1e-4,
+                    "rot={}, idx={}: expected {} got {} (full actual={:?})",
+                    rot, k, expected[k], actual[k], actual,
+                );
+            }
+        }
+    }
+
+    /// Real PDF round-trip: pass through `stamp_image` (always user_angle=0
+    /// in production until US-R2 wires it through) and confirm the existing
+    /// `assert_stamp_renders_at_display` invariants still hold for landscape
+    /// pages — a sanity check that adding the user_angle parameter didn't
+    /// regress the call site.
+    #[test]
+    fn stamp_image_user_rotation_zero_landscape_unchanged() {
+        let pdf = make_test_pdf(1000.0, 400.0, Some(270));
+        let img = make_red_png();
+        let stamped = stamp_image(&pdf, &img, 50.0, 30.0, 200.0, 80.0, 0.0).unwrap();
+        assert_stamp_renders_at_display(&stamped, 270, 1000.0, 400.0, 50.0, 30.0, 200.0, 80.0);
     }
 
     // -- Tests: coord_cm_for_rotation (property-based) ---------------------
@@ -1493,7 +1798,7 @@ mod tests {
         let img = make_solid_red_png(50, 50);
 
         let (dx, dy, w, h) = (200.0_f32, 300.0_f32, 100.0_f32, 100.0_f32);
-        let stamped = stamp_image(&pdf, &img, dx, dy, w, h).unwrap();
+        let stamped = stamp_image(&pdf, &img, dx, dy, w, h, 0.0).unwrap();
 
         let target_w = 600u16;
         let ((rx_min, rx_max), (ry_min, ry_max)) = red_bbox_in_render(&stamped, target_w);
@@ -1604,7 +1909,7 @@ mod tests {
         eprintln!("  display position (bottom-left of stamp) = ({}, {})", dx, dy);
         eprintln!("  display size                            = {} x {}", w, h);
 
-        let stamped = stamp_image(&pdf_bytes, &img_bytes, dx, dy, w, h).unwrap();
+        let stamped = stamp_image(&pdf_bytes, &img_bytes, dx, dy, w, h, 0.0).unwrap();
         let out_pdf = "/tmp/stamped-diagnostic.pdf";
         std::fs::write(out_pdf, &stamped).unwrap();
         eprintln!("\nstamped PDF written to {} ({} bytes)", out_pdf, stamped.len());
@@ -1686,7 +1991,7 @@ mod tests {
     fn form_bbox_uses_raw_dimensions() {
         let pdf = make_test_pdf(612.0, 792.0, Some(90));
         let img = make_red_png();
-        let stamped = stamp_image(&pdf, &img, 100.0, 200.0, 50.0, 60.0).unwrap();
+        let stamped = stamp_image(&pdf, &img, 100.0, 200.0, 50.0, 60.0, 0.0).unwrap();
 
         let doc = Document::load_mem(&stamped).unwrap();
         let page_id = doc.page_iter().next().unwrap();
@@ -1723,5 +2028,282 @@ mod tests {
             }
         }
         panic!("Stamp Form XObject not found");
+    }
+
+    // -- Tests: check_output_conflicts + stamp_paths_to_disk -----------------
+
+    /// Create a unique temp subdirectory for a test, removing any prior
+    /// instance. Avoids needing the `tempfile` crate as a dev-dependency.
+    fn make_tempdir(label: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "pdf-stamper-test-{}-{}-{}",
+            label,
+            std::process::id(),
+            nanos,
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn compute_output_path_uses_stem_and_suffix() {
+        let p = compute_output_path("/some/dir/example.pdf", "/out", "-stamped");
+        assert_eq!(p, "/out/example-stamped.pdf");
+    }
+
+    #[test]
+    fn check_output_conflicts_reports_only_existing_files() {
+        let out_dir = make_tempdir("conflicts");
+
+        // Two inputs: one whose output will already exist, one that won't.
+        let inputs = vec![
+            "/anywhere/alpha.pdf".to_string(),
+            "/anywhere/beta.pdf".to_string(),
+            "/anywhere/gamma.pdf".to_string(),
+        ];
+
+        // Pre-create alpha-stamped.pdf and gamma-stamped.pdf in out_dir.
+        std::fs::write(out_dir.join("alpha-stamped.pdf"), b"existing").unwrap();
+        std::fs::write(out_dir.join("gamma-stamped.pdf"), b"existing").unwrap();
+
+        let conflicts =
+            check_output_conflicts(&inputs, out_dir.to_str().unwrap(), STAMP_SUFFIX);
+
+        assert_eq!(conflicts.len(), 2);
+        assert_eq!(conflicts[0].idx, 0);
+        assert!(conflicts[0].output_path.ends_with("alpha-stamped.pdf"));
+        assert_eq!(conflicts[1].idx, 2);
+        assert!(conflicts[1].output_path.ends_with("gamma-stamped.pdf"));
+
+        let _ = std::fs::remove_dir_all(&out_dir);
+    }
+
+    #[test]
+    fn check_output_conflicts_returns_empty_when_no_conflicts() {
+        let out_dir = make_tempdir("noconflicts");
+        let inputs = vec!["/anywhere/lonely.pdf".to_string()];
+        let conflicts =
+            check_output_conflicts(&inputs, out_dir.to_str().unwrap(), STAMP_SUFFIX);
+        assert!(conflicts.is_empty());
+        let _ = std::fs::remove_dir_all(&out_dir);
+    }
+
+    #[test]
+    fn stamp_paths_to_disk_skips_indices() {
+        let in_dir = make_tempdir("stamp-in");
+        let out_dir = make_tempdir("stamp-out");
+
+        // Three input "PDFs" (just byte blobs — the stamp_fn here is a no-op).
+        let names = ["one", "two", "three"];
+        let mut input_paths = Vec::new();
+        for n in &names {
+            let p = in_dir.join(format!("{}.pdf", n));
+            std::fs::write(&p, format!("INPUT-{}", n).as_bytes()).unwrap();
+            input_paths.push(p.to_str().unwrap().to_string());
+        }
+
+        let mut seen_indices: Vec<usize> = Vec::new();
+        let written = stamp_paths_to_disk(
+            &input_paths,
+            &[1],
+            out_dir.to_str().unwrap(),
+            STAMP_SUFFIX,
+            |idx, bytes| {
+                seen_indices.push(idx);
+                let mut v = bytes.to_vec();
+                v.extend_from_slice(b"-STAMPED");
+                Ok(v)
+            },
+        )
+        .unwrap();
+
+        // Only indices 0 and 2 should have been processed/written.
+        assert_eq!(seen_indices, vec![0, 2]);
+        assert_eq!(written.len(), 2);
+        assert!(written[0].ends_with("one-stamped.pdf"));
+        assert!(written[1].ends_with("three-stamped.pdf"));
+
+        // Outputs exist on disk.
+        assert!(out_dir.join("one-stamped.pdf").exists());
+        assert!(out_dir.join("three-stamped.pdf").exists());
+        assert!(!out_dir.join("two-stamped.pdf").exists());
+
+        // Verify the no-op stamper was actually applied.
+        let body = std::fs::read(out_dir.join("one-stamped.pdf")).unwrap();
+        assert_eq!(body, b"INPUT-one-STAMPED");
+
+        let _ = std::fs::remove_dir_all(&in_dir);
+        let _ = std::fs::remove_dir_all(&out_dir);
+    }
+
+    #[test]
+    fn stamp_paths_to_disk_empty_skip_preserves_existing_behavior() {
+        let in_dir = make_tempdir("stamp-noskip-in");
+        let out_dir = make_tempdir("stamp-noskip-out");
+
+        let p = in_dir.join("doc.pdf");
+        std::fs::write(&p, b"INPUT").unwrap();
+        let input_paths = vec![p.to_str().unwrap().to_string()];
+
+        let written = stamp_paths_to_disk(
+            &input_paths,
+            &[],
+            out_dir.to_str().unwrap(),
+            STAMP_SUFFIX,
+            |_idx, bytes| Ok(bytes.to_vec()),
+        )
+        .unwrap();
+
+        assert_eq!(written.len(), 1);
+        assert!(written[0].ends_with("doc-stamped.pdf"));
+
+        let _ = std::fs::remove_dir_all(&in_dir);
+        let _ = std::fs::remove_dir_all(&out_dir);
+    }
+
+    // -- Tests: run_stamp_jobs (per-PDF configs, US-P3) ----------------------
+
+    /// Build a StampJob for an image stamp at the given placement on `path`.
+    fn img_job(
+        path: &str,
+        image_path: &str,
+        x: f32, y: f32, w: f32, h: f32,
+        rot: f32,
+    ) -> StampJob {
+        StampJob {
+            path: path.to_string(),
+            stamp_type: "image".to_string(),
+            image_path: Some(image_path.to_string()),
+            text: None,
+            font_size: None,
+            font_name: None,
+            color: None,
+            x,
+            y,
+            width: w,
+            height: h,
+            rotation_deg: Some(rot),
+        }
+    }
+
+    /// Verify a stamped output landed at the user-rotated rectangle around the
+    /// stamp center. Mirrors `image_cm_user_rotation_property`'s corner
+    /// geometry but reads the cm chain from the actual stamped PDF.
+    fn assert_stamp_rotates_around_center(
+        stamped_pdf: &[u8],
+        page_rotation: u32,
+        raw_w: f32, raw_h: f32,
+        dx: f32, dy: f32, w: f32, h: f32,
+        user_angle: f32,
+    ) {
+        let p = parse_stamp_placement(stamped_pdf);
+        let cm = compose(&[p.inner_cm, p.form_matrix, p.page_ctm]);
+        let center = (dx + w / 2.0, dy + h / 2.0);
+        let unrotated_corners: [((f32, f32), (f32, f32)); 4] = [
+            ((0.0, 0.0), (dx,     dy)),
+            ((1.0, 0.0), (dx + w, dy)),
+            ((0.0, 1.0), (dx,     dy + h)),
+            ((1.0, 1.0), (dx + w, dy + h)),
+        ];
+        for (unit, unrotated_disp) in unrotated_corners {
+            let raw = apply_cm(cm, unit);
+            let disp = apply_t_rotate(page_rotation, raw, raw_w, raw_h);
+            let expected = rotate_around(unrotated_disp, center, user_angle);
+            assert!(
+                (disp.0 - expected.0).abs() < 0.5 && (disp.1 - expected.1).abs() < 0.5,
+                "user_angle={}, unit={:?}: expected display {:?} got {:?}",
+                user_angle, unit, expected, disp,
+            );
+        }
+    }
+
+    /// Headline US-P3 test: three PDFs stamped via run_stamp_jobs, each with
+    /// its own (x, y, w, h, rotation_deg). Reading the cm chain back from each
+    /// output verifies the per-job dispatch actually used that file's params.
+    #[test]
+    fn run_stamp_jobs_applies_per_pdf_configs() {
+        let in_dir = make_tempdir("perpdf-in");
+        let out_dir = make_tempdir("perpdf-out");
+
+        // Three input PDFs with the same MediaBox.
+        let raw_w = 612.0_f32;
+        let raw_h = 792.0_f32;
+        let names = ["alpha", "beta", "gamma"];
+        let mut input_paths = Vec::new();
+        for n in &names {
+            let p = in_dir.join(format!("{}.pdf", n));
+            std::fs::write(&p, make_test_pdf(raw_w, raw_h, None)).unwrap();
+            input_paths.push(p.to_str().unwrap().to_string());
+        }
+
+        // One image, reused (verifies the cache path).
+        let img_path = in_dir.join("stamp.png");
+        std::fs::write(&img_path, make_red_png()).unwrap();
+        let img_str = img_path.to_str().unwrap();
+
+        // Distinct per-file placements; gamma carries a non-zero rotation.
+        let placements = [
+            (50.0_f32, 60.0_f32, 100.0_f32, 80.0_f32, 0.0_f32),
+            (200.0,    300.0,    150.0,    75.0,     0.0),
+            (100.0,    200.0,    50.0,     50.0,     45.0),
+        ];
+        let jobs: Vec<StampJob> = input_paths
+            .iter()
+            .zip(&placements)
+            .map(|(path, (x, y, w, h, rot))| img_job(path, img_str, *x, *y, *w, *h, *rot))
+            .collect();
+
+        let written =
+            run_stamp_jobs(&jobs, out_dir.to_str().unwrap(), &[]).unwrap();
+        assert_eq!(written.len(), 3);
+
+        for (out_path, (x, y, w, h, rot)) in written.iter().zip(&placements) {
+            let bytes = std::fs::read(out_path).unwrap();
+            assert_stamp_rotates_around_center(
+                &bytes, 0, raw_w, raw_h, *x, *y, *w, *h, *rot,
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&in_dir);
+        let _ = std::fs::remove_dir_all(&out_dir);
+    }
+
+    /// run_stamp_jobs respects skip_indices (skipped jobs produce no output).
+    #[test]
+    fn run_stamp_jobs_respects_skip_indices() {
+        let in_dir = make_tempdir("skipperpdf-in");
+        let out_dir = make_tempdir("skipperpdf-out");
+
+        let raw_w = 612.0_f32;
+        let raw_h = 792.0_f32;
+        let mut input_paths = Vec::new();
+        for n in &["a", "b", "c"] {
+            let p = in_dir.join(format!("{}.pdf", n));
+            std::fs::write(&p, make_test_pdf(raw_w, raw_h, None)).unwrap();
+            input_paths.push(p.to_str().unwrap().to_string());
+        }
+        let img_path = in_dir.join("stamp.png");
+        std::fs::write(&img_path, make_red_png()).unwrap();
+        let img_str = img_path.to_str().unwrap();
+
+        let jobs: Vec<StampJob> = input_paths
+            .iter()
+            .map(|p| img_job(p, img_str, 10.0, 20.0, 30.0, 40.0, 0.0))
+            .collect();
+
+        let written =
+            run_stamp_jobs(&jobs, out_dir.to_str().unwrap(), &[1]).unwrap();
+        assert_eq!(written.len(), 2);
+        assert!(written[0].ends_with("a-stamped.pdf"));
+        assert!(written[1].ends_with("c-stamped.pdf"));
+        assert!(!out_dir.join("b-stamped.pdf").exists());
+
+        let _ = std::fs::remove_dir_all(&in_dir);
+        let _ = std::fs::remove_dir_all(&out_dir);
     }
 }

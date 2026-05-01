@@ -37,8 +37,36 @@ export async function selectOutputDir(): Promise<string | null> {
   return typeof selected === 'string' ? selected : null;
 }
 
-export interface StampParams {
-  paths: string[];
+export interface ConflictInput {
+  path: string;
+}
+
+export interface Conflict {
+  idx: number;
+  output_path: string;
+}
+
+export type ConflictDecision = 'overwrite' | 'skip';
+
+export async function checkOutputConflicts(
+  inputs: ConflictInput[],
+  outputDir: string,
+  suffix: string,
+): Promise<Conflict[]> {
+  return invoke<Conflict[]>('check_output_conflicts', {
+    inputs,
+    outputDir,
+    suffix,
+  });
+}
+
+/** One PDF's complete stamp configuration. The frontend builds an array of
+ * these (one per loaded PDF, computed via `getEffectiveConfig(pdfId)`) before
+ * invoking `stampAllPdfs`. Stamp content fields (imagePath/text/...) are
+ * per-job for symmetry with the store's `StampConfig`, even though the UI
+ * keeps stamp content global today. */
+export interface StampJob {
+  path: string;
   stampType: 'image' | 'text';
   imagePath: string | null;
   text: string | null;
@@ -49,22 +77,20 @@ export interface StampParams {
   y: number;
   width: number;
   height: number;
+  /** Stamp rotation in degrees CCW around the stamp's center. */
+  rotationDeg?: number;
+}
+
+export interface StampParams {
+  jobs: StampJob[];
   outputDir: string;
+  skipIndices?: number[];
 }
 
 export async function stampAllPdfs(params: StampParams): Promise<string[]> {
   return invoke<string[]>('stamp_pdfs', {
-    paths: params.paths,
-    stampType: params.stampType,
-    imagePath: params.imagePath,
-    text: params.text,
-    fontSize: params.fontSize,
-    fontName: params.fontName,
-    color: params.color,
-    x: params.x,
-    y: params.y,
-    width: params.width,
-    height: params.height,
+    jobs: params.jobs,
     outputDir: params.outputDir,
+    skipIndices: params.skipIndices,
   });
 }

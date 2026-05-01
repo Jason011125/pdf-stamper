@@ -14,8 +14,8 @@
         "cd src-tauri && cargo test passes."
       ],
       "priority": 1,
-      "passes": false,
-      "notes": ""
+      "passes": true,
+      "notes": "stamp_pdfs Tauri arg is skipIndices (camelCase, Option<Vec<usize>>). check_output_conflicts returns Vec<{idx, output_path}> (snake_case, like PdfInfo). Suffix constant is pdf::STAMP_SUFFIX = \"-stamped\". Loop logic refactored into pdf::stamp_paths_to_disk for testability."
     },
     {
       "id": "US-002b",
@@ -29,8 +29,8 @@
         "Vitest test for the bridge that mocks @tauri-apps/api invoke and asserts checkOutputConflicts forwards args correctly and parses the response shape."
       ],
       "priority": 2,
-      "passes": false,
-      "notes": "Depends on US-002a's Rust command being merged."
+      "passes": true,
+      "notes": "Bridge exports: checkOutputConflicts, Conflict, ConflictInput, ConflictDecision. Conflict.output_path is snake_case (matches Rust Serialize default + PdfInfo convention). stampAllPdfs accepts optional skipIndices?: number[]; when undefined, Tauri/JSON drops the key and Rust deserializes as None."
     },
     {
       "id": "US-002c",
@@ -46,8 +46,8 @@
         "Manual verify recipe in commit body: load 2 PDFs with the same filename in different dirs → click Export → expect dialog with 'Overwrite/Cancel/Overwrite all/Cancel all' buttons; verify each button's behavior."
       ],
       "priority": 3,
-      "passes": false,
-      "notes": "Depends on US-002a + US-002b."
+      "passes": true,
+      "notes": "Reducer + types live in components/conflict-dialog.tsx (exported: conflictReducer, initialConflictState, isConflictComplete, ConflictAction, ConflictState). Tests in conflict-dialog.test.tsx. UI uses STAMP_SUFFIX = '-stamped' duplicated as a const at the top of stamp-controls (matches Rust pdf::STAMP_SUFFIX). Dialog renders only when pendingConflicts state is set; on completion calls onDone(decisions) and parent maps conflict.idx → skipIndices."
     },
     {
       "id": "US-R1",
@@ -61,8 +61,8 @@
         "Existing behavior with user_angle=0 must be byte-identical to current image_cm_for_rotation."
       ],
       "priority": 4,
-      "passes": false,
-      "notes": "Independent of US-002* — different code path. Touch pdf.rs production code is expected here (this is a feature, not a test refactor)."
+      "passes": true,
+      "notes": "image_cm_for_rotation now takes user_angle_deg: f32 as its 8th positional arg (CCW around stamp center). Built from new affine helpers (affine_mul/translate/scale/rotate_deg + t_rotate_inverse) at the top of pdf.rs. stamp_image passes 0.0 for now — US-R2 plumbs the real angle through. Property tests cover all 4 page rotations × 7 user angles + a byte-identity guard vs the previous closed-form matrices."
     },
     {
       "id": "US-R2",
@@ -79,8 +79,8 @@
         "Manual verify recipe in commit body: open 1 PDF, drag stamp, change rotation slider → live preview rotates; export → rendered PDF stamp matches the rotation."
       ],
       "priority": 5,
-      "passes": false,
-      "notes": "Depends on US-R1's Rust function."
+      "passes": true,
+      "notes": "Store: rotationDeg + setRotationDeg (normalized to [0, 360) via mod-then-add-mod, NaN→0). Preview: stampRotationStyle(rotationDeg) helper exported from preview-pane.tsx negates the angle for CSS (CCW user → CW screen). Bridge: optional rotationDeg in StampParams; absent = Rust None = 0.0. Rust: stamp_image now takes user_angle_deg as 7th arg; commands::stamp_pdfs accepts optional rotation_deg (camelCase rotationDeg over IPC). All 9 stamp_image test call sites pass 0.0 for the new arg."
     },
     {
       "id": "US-P1",
@@ -97,8 +97,8 @@
         "This story does NOT yet wire the new shape into UI components — that's US-P2. Existing components may need a tiny shim (e.g., calling getEffectiveConfig with a fixed id) to keep compiling. Acceptable."
       ],
       "priority": 6,
-      "passes": false,
-      "notes": "Pure store refactor + invariant tests."
+      "passes": true,
+      "notes": "stamp-store now exports StampConfig + DEFAULT_STAMP_CONFIG. Store shape: { defaultConfig, overrides, isPlaced, isExporting, exportProgress } + new actions (setDefault, setOverride, clearOverride) + selector getEffectiveConfig(pdfId). All existing setters (setPosition, setSize, setRotationDeg, setColor, ...) kept as backcompat shims that write to default — US-P2 will replace UI call sites with setOverride(currentPdfId, ...). rotationDeg normalization is centralized in normalizePartial() so both setDefault and setOverride apply it. Components currently read via useStampStore(s => s.defaultConfig.X) — US-P2 will swap that to s.getEffectiveConfig(currentPdfId).X."
     },
     {
       "id": "US-P2",
@@ -112,8 +112,8 @@
         "Manual verify recipe in commit body."
       ],
       "priority": 7,
-      "passes": false,
-      "notes": "Depends on US-P1. The 'first edit writes default, subsequent edits write override' rule is the trickiest UX bit; document it clearly."
+      "passes": true,
+      "notes": "New store action applyEdit(pdfId, partial) is the single enforcement point for the bootstrap rule: the first call (hasBootstrappedDefault=false) writes defaultConfig and flips the flag; every subsequent call writes overrides[pdfId]. UI components call applyEdit (never setDefault) for position/size/rotation. Image/text/color/font/lockAspect remain on default via existing shims (US-P3 may need to revisit if it adds per-PDF text edits). All component reads now go through getEffectiveConfig(currentPdfId), where currentPdfId = files[selectedIndex]?.path ?? ''. Document the bootstrap rule lives in progress.txt 'Codebase Patterns' (CLAUDE.md edit was rejected — patterns section in progress.txt is the canonical source for cross-iteration rules)."
     },
     {
       "id": "US-P3",
@@ -129,8 +129,78 @@
         "Manual verify recipe in commit body: load 5 PDFs, set distinct positions and rotations on each, export, open all 5 in a viewer, confirm each is correct."
       ],
       "priority": 8,
-      "passes": false,
-      "notes": "Depends on US-P1, US-P2, US-R1."
+      "passes": true,
+      "notes": "Rust commands::stamp_pdfs collapsed to a thin async wrapper around new pdf::run_stamp_jobs (non-async, testable). StampJob struct lives in pdf.rs (Deserialize + rename_all=camelCase). Image bytes are cached by image_path so repeated jobs with the same image read once. Frontend StampParams shape changed to { jobs: StampJob[]; outputDir; skipIndices? } — components iterate files and call getEffectiveConfig(f.path) per file to assemble jobs. Tests: pdf::run_stamp_jobs_applies_per_pdf_configs (3 PDFs with distinct (x,y,w,h,rotation) verified via parse_stamp_placement + corner-rotated-around-center geometry), pdf::run_stamp_jobs_respects_skip_indices, plus the rewritten pdf-bridge.test.ts 'jobs payload' describe block. All 34 cargo + 50 vitest pass."
+    },
+    {
+      "id": "US-FIX1",
+      "title": "Edits on the master (first) PDF must propagate to all unoverridden PDFs",
+      "description": "Reported by user during smoke test: dragging the stamp position on PDF #1 propagates to PDFs #2–#10 ✓ (because that's the *first* applyEdit, so it writes defaultConfig). But the next user action — adjusting rotation on PDF #1 — only changes #1 ❌, because applyEdit's 'first edit ever writes default; everything after writes override' rule routes the second+ edit to overrides[#1]. Replace this rule with an index-based rule: edits while the user is on the FIRST PDF in pdf-store's files (the 'master') write to defaultConfig; edits while on any other PDF write to that PDF's override.",
+      "acceptanceCriteria": [
+        "Remove the `hasBootstrappedDefault` flag from stamp-store.ts and the bootstrap branch in applyEdit.",
+        "Either: (a) keep applyEdit and have it read pdf-store inside (cross-store call: `usePdfStore.getState().files[0]?.path === pdfId` decides default-vs-override), OR (b) drop applyEdit entirely and have UI components (preview-pane, stamp-controls) inline the master check before calling setDefault or setOverride. Either is acceptable; pick the one that requires fewer test rewrites and document the choice in the commit body.",
+        "Behavioral invariant: applyEdit (or its replacement) on the master PDF writes to defaultConfig; on any other PDF writes to overrides[pdfId]. Master = files[0] in pdf-store.",
+        "When the master PDF is later removed (handled by US-FIX2), files[0] becomes the next PDF; subsequent edits on what is now files[0] write to default. No extra bookkeeping needed because the rule is purely index-based.",
+        "Update src/stores/stamp-store.test.ts: drop the `hasBootstrappedDefault` test, add tests for the new rule. Concretely: with 5 mock pdfIds ['a','b','c','d','e'] in pdf-store, editing on 'a' (master) writes default → all 5 effective configs reflect it; editing on 'c' (non-master) writes overrides['c'] only; after pdf-store removes 'a', editing on 'b' (now master) writes default.",
+        "Update existing UI tests if they relied on the old bootstrap behavior.",
+        "tsc --noEmit and vitest run pass.",
+        "Update the 'Per-PDF stamp config — override-on-edit rule' entry in scripts/ralph/progress.txt's Codebase Patterns section to reflect the new rule. Remove references to the deprecated bootstrap flag.",
+        "Manual verify recipe in commit body: load 5 PDFs → drag position on #1 (master) → expect all 5 to follow → adjust rotation on #1 → expect all 5 still to follow (this is the bug we're fixing) → switch to #3, drag → only #3 changes → switch back to #1, adjust size → all unoverridden follow, #3 stays."
+      ],
+      "priority": 9,
+      "passes": true,
+      "notes": "Approach (a): kept applyEdit, added cross-store read of usePdfStore.getState().files[0]?.path. Master = files[0]; rule is purely index-based, no flag. applyEdit is also a no-op when pdfId is empty (covers 'no PDFs loaded yet'). Removed hasBootstrappedDefault from store + interface + test reset. Tests rewritten in stamp-store.test.ts under 'master-index rule (US-FIX1)' — covers all AC scenarios incl. the regression (repeated master edits stay on default) and post-removal master promotion. Pattern entry in progress.txt updated."
+    },
+    {
+      "id": "US-FIX2",
+      "title": "Fix unreliable X-button removal of PDFs from the file list",
+      "description": "Reported by user: clicking the X button on a loaded PDF in the left file list sometimes does not remove the PDF. Diagnose first, then fix. While there, also clean up two related concerns: removing a PDF must call useStampStore.getState().clearOverride(pdfId) so its override doesn't leak, and must URL.revokeObjectURL on its preview to avoid memory leak.",
+      "acceptanceCriteria": [
+        "Reproduce the bug first. Try removing PDFs at index 0, middle, last; one with a stamp-store override; the currently-selected one. Document what you found in the commit body.",
+        "Fix the root cause. Common suspects: (a) handler captured a stale array index, (b) removeFile in pdf-store doesn't actually mutate state, (c) click event swallowed by parent dialog/overlay, (d) selected-index out-of-bounds after removal preventing re-render.",
+        "Removal flow must: (1) call pdf-store's removeFile/equivalent on the correct pdfId, (2) call useStampStore.getState().clearOverride(pdfId), (3) URL.revokeObjectURL on the previewUrl if present.",
+        "If the removed PDF was currently selected, the new selection should be the first remaining PDF (or no selection if list empty).",
+        "Vitest tests: remove-first, remove-middle, remove-last, remove-only-one (list becomes empty), remove-with-override (override entry is gone from stamp-store), remove-currently-selected (selection updates).",
+        "tsc --noEmit and vitest run pass.",
+        "Manual verify recipe in commit body: load 5 PDFs, override #2 and #4 with distinct positions, remove each in turn (#5, #4, #3, #2, #1) and verify list shrinks correctly each time, no stale overrides remain, selection moves sensibly."
+      ],
+      "priority": 10,
+      "passes": true,
+      "notes": "Two issues found: (1) tiny X-button hit target (just the &times; glyph, no padding) — misclicks land on the row's onClick (setSelectedIndex) instead, looking like 'didn't remove'. (2) removeFile didn't clearOverride or apply the AC's 'first remaining PDF' selection rule. Fixed: removeFile now takes a pdfId (string) — looked up via findIndex on path — eliminating any stale-index risk; FileList orchestrates removeFile + clearOverride in a handleRemove helper (avoids cycle between pdf-store and stamp-store); X-button is now h-6 w-6 with hover bg for an obvious target. Selection rule: removed=selected → goto 0; removed before selected → decrement; removed after selected → unchanged. New tests in src/stores/pdf-store.test.ts (14) cover all AC scenarios incl. the cross-store flow."
+    },
+    {
+      "id": "US-FIX3",
+      "title": "Fix conflict-dialog flow: file picker should not appear after 'Overwrite all'",
+      "description": "Reported by user: when clicking 'Overwrite all' (or 'Cancel all') in the conflict dialog, a macOS file Open dialog appears (not a save dialog, not a directory picker — a *file* Open dialog showing files in Downloads). Expected flow: pick output directory ONCE before checkOutputConflicts → walk conflicts via dialog → on completion, stampAllPdfs runs without further prompts.",
+      "acceptanceCriteria": [
+        "Diagnose first. Read stamp-controls.tsx and conflict-dialog.tsx. List every dialog/picker call (open(), save(), confirm()). Document the current order in the commit body. Specifically check: is openPdfDialog() (the input-file picker, used to load PDFs) being invoked from a conflict-dialog button handler by mistake? The user's screenshot shows a file Open dialog listing files in Downloads — that's the file picker for input PDFs, which strongly suggests this is the bug.",
+        "Re-order or fix the flow so it is: (1) Export click → (2) plugin-dialog `open({ directory: true })` picks output dir ONCE → (3) checkOutputConflicts(inputs, outputDir, suffix) → (4) if conflicts: render <ConflictDialog/> with 4 buttons; user makes decisions → (5) on dialog completion, stampAllPdfs(jobs, outputDir, skipIndices) → (6) success toast.",
+        "'Overwrite all' and 'Cancel all' buttons MUST NOT trigger any open()/save()/dialog. They only update the conflict reducer state and dispatch the final stampAllPdfs call.",
+        "Vitest: extend conflict-dialog.test.tsx — using @testing-library/react, mount the dialog with 5 mock conflicts, simulate clicking 'Overwrite all', assert onDone is called with ['overwrite','overwrite','overwrite','overwrite','overwrite'] AND that no Tauri open() / dialog mock is invoked between click and onDone. Same for 'Cancel all' yielding 5 'skip'.",
+        "tsc --noEmit and vitest run pass.",
+        "Manual verify recipe in commit body: load 2 PDFs with same filename from different dirs → click Export → ONE directory-picker dialog appears → pick a directory → conflict-dialog appears → click 'Overwrite all' → expect NO further prompts → expect 2 stamped files saved in chosen directory."
+      ],
+      "priority": 11,
+      "passes": true,
+      "notes": "Diagnosis: traced every dialog/picker call. Export flow is already (1) selectOutputDir → open({directory:true}) ONCE → (2) checkOutputConflicts (IPC, no UI) → (3) setPendingConflicts → ConflictDialog renders → (4) buttons dispatch reducer (no IPC) → (5) useEffect[state] fires onDone(decisions) → (6) handleConflictsResolved unmounts dialog and calls runStamp → stampAllPdfs (IPC, no UI). No `open()` call exists anywhere on the conflict-dialog → onDone path; the prd's speculation about openPdfDialog was incorrect. The user's smoke-test report likely predates the current code or conflated step (1)'s directory picker with a file picker. Fix here is a regression-guard test: vi.mock('@tauri-apps/plugin-dialog'), render <ConflictDialog/> with 5 conflicts, click 'Overwrite all'/'Cancel all', assert onDone fired once with the expected decisions AND open mock never invoked. Also added single-button advance tests as bonus coverage. 68 vitest pass (was 64), tsc clean, no Rust changes."
+    },
+    {
+      "id": "US-R3",
+      "title": "Quick rotation buttons (+90 and -90) in stamp controls",
+      "description": "Add two quick-rotate buttons next to the existing rotation number input in stamp-controls.tsx. The +90° button rotates the stamp 90° CCW; the −90° button rotates 90° CW. Both must route through the same applyEdit path used by the existing rotation input so the master-vs-override rule (US-FIX1) is preserved.",
+      "acceptanceCriteria": [
+        "Two new buttons rendered in src/components/stamp-controls.tsx adjacent to the existing rotationDeg input. Label them clearly (e.g. '+90°' and '−90°' or use rotation icons).",
+        "+90° button: new rotationDeg = (current + 90) mod 360, applied via stamp-store's applyEdit(currentPdfId, { rotationDeg: ... }).",
+        "−90° button: new rotationDeg = (current - 90 + 360) mod 360, applied via the same applyEdit path.",
+        "Master-rule (US-FIX1) preserved: when currentPdfId === files[0]?.path, clicks update defaultConfig (so all unoverridden PDFs follow); on a non-master PDF, clicks update overrides[currentPdfId] only. Do NOT call setRotationDeg directly — that bypasses the master rule.",
+        "Buttons are disabled (or hidden) when no PDF is loaded (currentPdfId is empty), matching the disabled state of the existing rotation input.",
+        "Vitest in stamp-controls.test.tsx (or new file): (a) click +90° four times → rotationDeg back to original (mod 360 wrap), (b) click on master PDF propagates to all unoverridden PDFs in effective config, (c) click on non-master PDF only changes that PDF's effective config, (d) -90° from 0 yields 270.",
+        "tsc --noEmit and vitest run pass.",
+        "Manual verify recipe in commit body: load 3 PDFs → click +90° on PDF #1 (master) → all 3 previews rotate 90° → switch to PDF #2 → click -90° → only PDF #2 rotates back."
+      ],
+      "priority": 12,
+      "passes": true,
+      "notes": "Pure UI addition. Two buttons (−90° / +90°) live below the slider/number row in stamp-controls.tsx; both call applyEdit(currentPdfId, { rotationDeg: ... }) with explicit (cur ± 90 + 360) % 360 wrap (store normalizes too — explicit wrap is for test-assertion clarity). Buttons disable when currentPdfId is empty. aria-labels: 'Rotate stamp 90 degrees clockwise' (−90°) and 'Rotate stamp 90 degrees counter-clockwise' (+90°) — note '/clockwise/i' regex matches BOTH, so tests must use exact aria-label strings or anchor the regex. New file src/components/stamp-controls.test.tsx (7 tests) renders <StampControls/>; mocks @tauri-apps/plugin-dialog and @tauri-apps/api/core (imports only — no callbacks fire on render)."
     }
   ]
 }

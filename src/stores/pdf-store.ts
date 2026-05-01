@@ -14,7 +14,12 @@ interface PdfStore {
   addFiles: (files: PdfFile[]) => void;
   setSelectedIndex: (index: number) => void;
   setPreviewUrl: (index: number, url: string) => void;
-  removeFile: (index: number) => void;
+  /** Remove a file by pdfId (path). Revokes its previewUrl. Selection rule:
+   * if the removed PDF was currently selected, jump to the first remaining
+   * PDF (index 0); otherwise track the same selected file (decrement index
+   * when the removed one was before it). Lookup by id avoids stale-index
+   * bugs from rapid clicks during reorders / concurrent removals. */
+  removeFile: (pdfId: string) => void;
   clearFiles: () => void;
 }
 
@@ -36,12 +41,22 @@ export const usePdfStore = create<PdfStore>((set) => ({
       ),
     })),
 
-  removeFile: (index) =>
+  removeFile: (pdfId) =>
     set((state) => {
-      const prev = state.files[index]?.previewUrl;
-      if (prev) URL.revokeObjectURL(prev);
-      const files = state.files.filter((_, i) => i !== index);
-      const selectedIndex = Math.min(state.selectedIndex, Math.max(0, files.length - 1));
+      const idx = state.files.findIndex((f) => f.path === pdfId);
+      if (idx === -1) return state;
+
+      const removed = state.files[idx];
+      if (removed?.previewUrl) URL.revokeObjectURL(removed.previewUrl);
+
+      const files = state.files.filter((_, i) => i !== idx);
+
+      let selectedIndex = state.selectedIndex;
+      if (idx === state.selectedIndex) {
+        selectedIndex = 0;
+      } else if (idx < state.selectedIndex) {
+        selectedIndex = state.selectedIndex - 1;
+      }
       return { files, selectedIndex };
     }),
 

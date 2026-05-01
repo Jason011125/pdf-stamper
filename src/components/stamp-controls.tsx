@@ -1,9 +1,19 @@
-import { useCallback } from 'react';
+import { useCallback, useState } from 'react';
 import { useStampStore, type StampType } from '../stores/stamp-store';
 import { usePdfStore } from '../stores/pdf-store';
-import { stampAllPdfs, selectOutputDir } from '../services/pdf-bridge';
+import {
+  stampAllPdfs,
+  selectOutputDir,
+  checkOutputConflicts,
+  type Conflict,
+  type ConflictDecision,
+  type StampJob,
+} from '../services/pdf-bridge';
 import { open } from '@tauri-apps/plugin-dialog';
 import { invoke } from '@tauri-apps/api/core';
+import { ConflictDialog } from './conflict-dialog';
+
+const STAMP_SUFFIX = '-stamped';
 
 async function readImagePreview(path: string): Promise<string> {
   const bytes = await invoke<number[]>('read_file_bytes', { path });
@@ -25,34 +35,49 @@ const DEFAULT_STAMP_LONG_SIDE = 100;
 
 export function StampControls(): React.JSX.Element {
   const files = usePdfStore((s) => s.files);
+  const selectedIndex = usePdfStore((s) => s.selectedIndex);
+  const currentPdfId = files[selectedIndex]?.path ?? '';
 
-  const stampType = useStampStore((s) => s.type);
+  // Reads go through getEffectiveConfig(currentPdfId): merged default + override.
+  // Writes for position/size/rotation route through applyEdit (first call writes
+  // default as bootstrap, subsequent calls write overrides[currentPdfId]).
+  // Image / text / color / font / lockAspect remain on default via the existing
+  // shims — those are global stamp setup, not per-PDF position/size/rotation.
+  const stampType = useStampStore((s) => s.getEffectiveConfig(currentPdfId).type);
   const setType = useStampStore((s) => s.setType);
-  const imagePreviewUrl = useStampStore((s) => s.imagePreviewUrl);
-  const imagePath = useStampStore((s) => s.imagePath);
+  const imagePreviewUrl = useStampStore(
+    (s) => s.getEffectiveConfig(currentPdfId).imagePreviewUrl,
+  );
   const setImage = useStampStore((s) => s.setImage);
   const clearImage = useStampStore((s) => s.clearImage);
-  const text = useStampStore((s) => s.text);
+  const text = useStampStore((s) => s.getEffectiveConfig(currentPdfId).text);
   const setText = useStampStore((s) => s.setText);
-  const fontSize = useStampStore((s) => s.fontSize);
+  const fontSize = useStampStore((s) => s.getEffectiveConfig(currentPdfId).fontSize);
   const setFontSize = useStampStore((s) => s.setFontSize);
-  const color = useStampStore((s) => s.color);
+  const color = useStampStore((s) => s.getEffectiveConfig(currentPdfId).color);
   const setColor = useStampStore((s) => s.setColor);
-  const widthPt = useStampStore((s) => s.widthPt);
-  const heightPt = useStampStore((s) => s.heightPt);
+  const widthPt = useStampStore((s) => s.getEffectiveConfig(currentPdfId).widthPt);
+  const heightPt = useStampStore((s) => s.getEffectiveConfig(currentPdfId).heightPt);
   const setSize = useStampStore((s) => s.setSize);
-  const lockAspect = useStampStore((s) => s.lockAspect);
+  const lockAspect = useStampStore(
+    (s) => s.getEffectiveConfig(currentPdfId).lockAspect,
+  );
   const setLockAspect = useStampStore((s) => s.setLockAspect);
-  const lockedAspect = useStampStore((s) => s.lockedAspect);
+  const lockedAspect = useStampStore(
+    (s) => s.getEffectiveConfig(currentPdfId).lockedAspect,
+  );
   const setLockedAspect = useStampStore((s) => s.setLockedAspect);
-  const xPt = useStampStore((s) => s.xPt);
-  const yPt = useStampStore((s) => s.yPt);
+  const xPt = useStampStore((s) => s.getEffectiveConfig(currentPdfId).xPt);
+  const yPt = useStampStore((s) => s.getEffectiveConfig(currentPdfId).yPt);
+  const rotationDeg = useStampStore(
+    (s) => s.getEffectiveConfig(currentPdfId).rotationDeg,
+  );
+  const applyEdit = useStampStore((s) => s.applyEdit);
   const isPlaced = useStampStore((s) => s.isPlaced);
   const isExporting = useStampStore((s) => s.isExporting);
   const setExporting = useStampStore((s) => s.setExporting);
   const exportProgress = useStampStore((s) => s.exportProgress);
   const setExportProgress = useStampStore((s) => s.setExportProgress);
-  const fontName = useStampStore((s) => s.fontFamily);
 
   const handleImageUpload = useCallback(async () => {
     const selected = await open({
@@ -91,31 +116,31 @@ export function StampControls(): React.JSX.Element {
       if (!Number.isFinite(newW) || newW <= 0) {
         // Allow the input to display 0/empty during typing, but don't propagate
         // a degenerate value into store — keeps locked aspect intact.
-        setSize(Math.max(0, newW), heightPt);
+        applyEdit(currentPdfId, { widthPt: Math.max(0, newW), heightPt });
         return;
       }
       if (lockAspect && lockedAspect > 0) {
-        setSize(newW, newW / lockedAspect);
+        applyEdit(currentPdfId, { widthPt: newW, heightPt: newW / lockedAspect });
       } else {
-        setSize(newW, heightPt);
+        applyEdit(currentPdfId, { widthPt: newW, heightPt });
       }
     },
-    [lockAspect, lockedAspect, heightPt, setSize],
+    [lockAspect, lockedAspect, heightPt, applyEdit, currentPdfId],
   );
 
   const handleHeightChange = useCallback(
     (newH: number) => {
       if (!Number.isFinite(newH) || newH <= 0) {
-        setSize(widthPt, Math.max(0, newH));
+        applyEdit(currentPdfId, { widthPt, heightPt: Math.max(0, newH) });
         return;
       }
       if (lockAspect && lockedAspect > 0) {
-        setSize(newH * lockedAspect, newH);
+        applyEdit(currentPdfId, { widthPt: newH * lockedAspect, heightPt: newH });
       } else {
-        setSize(widthPt, newH);
+        applyEdit(currentPdfId, { widthPt, heightPt: newH });
       }
     },
-    [lockAspect, lockedAspect, widthPt, setSize],
+    [lockAspect, lockedAspect, widthPt, applyEdit, currentPdfId],
   );
 
   // When the user toggles lock back ON, capture the *current* W/H ratio so
@@ -131,42 +156,90 @@ export function StampControls(): React.JSX.Element {
     [widthPt, heightPt, setLockAspect, setLockedAspect],
   );
 
+  const [pendingConflicts, setPendingConflicts] = useState<{
+    conflicts: Conflict[];
+    outputDir: string;
+  } | null>(null);
+
+  // getEffectiveConfig is a function selector (returns a fresh object on each
+  // call). Subscribing to it directly would re-render every state change —
+  // instead we pull it from the store imperatively at submit time.
+  const getEffectiveConfig = useStampStore((s) => s.getEffectiveConfig);
+
+  const runStamp = useCallback(
+    async (outputDir: string, skipIndices: number[]) => {
+      setExporting(true);
+      setExportProgress(0, files.length);
+      try {
+        // Assemble per-PDF jobs: each loaded PDF gets its effective config
+        // (default merged with that PDF's override). Position/size/rotation
+        // can therefore differ per file; stamp content is the same across
+        // files in today's UI but the per-job shape leaves room for that.
+        const jobs: StampJob[] = files.map((f) => {
+          const cfg = getEffectiveConfig(f.path);
+          return {
+            path: f.path,
+            stampType: cfg.type,
+            imagePath: cfg.type === 'image' ? cfg.imagePath : null,
+            text: cfg.type === 'text' ? cfg.text : null,
+            fontSize: cfg.type === 'text' ? cfg.fontSize : null,
+            fontName: cfg.type === 'text' ? cfg.fontFamily : null,
+            color: cfg.type === 'text' ? cfg.color : null,
+            x: cfg.xPt,
+            y: cfg.yPt,
+            width: cfg.widthPt,
+            height: cfg.heightPt,
+            rotationDeg: cfg.rotationDeg,
+          };
+        });
+        const result = await stampAllPdfs({
+          jobs,
+          outputDir,
+          skipIndices: skipIndices.length > 0 ? skipIndices : undefined,
+        });
+        setExportProgress(result.length, files.length);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        alert(`Export failed: ${message}`);
+      } finally {
+        setExporting(false);
+      }
+    },
+    [files, getEffectiveConfig, setExporting, setExportProgress],
+  );
+
   const handleApplyAll = useCallback(async () => {
     if (files.length === 0 || !isPlaced) return;
 
     const dir = await selectOutputDir();
     if (!dir) return;
 
-    setExporting(true);
-    setExportProgress(0, files.length);
+    const conflicts = await checkOutputConflicts(
+      files.map((f) => ({ path: f.path })),
+      dir,
+      STAMP_SUFFIX,
+    );
 
-    try {
-      const paths = files.map((f) => f.path);
-      const result = await stampAllPdfs({
-        paths,
-        stampType,
-        imagePath: stampType === 'image' ? imagePath : null,
-        text: stampType === 'text' ? text : null,
-        fontSize: stampType === 'text' ? fontSize : null,
-        fontName: stampType === 'text' ? fontName : null,
-        color: stampType === 'text' ? color : null,
-        x: xPt,
-        y: yPt,
-        width: widthPt,
-        height: heightPt,
-        outputDir: dir,
-      });
-      setExportProgress(result.length, files.length);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      alert(`Export failed: ${message}`);
-    } finally {
-      setExporting(false);
+    if (conflicts.length === 0) {
+      await runStamp(dir, []);
+      return;
     }
-  }, [
-    files, isPlaced, stampType, imagePath, text, fontSize, fontName, color,
-    xPt, yPt, widthPt, heightPt, setExporting, setExportProgress,
-  ]);
+
+    setPendingConflicts({ conflicts, outputDir: dir });
+  }, [files, isPlaced, runStamp]);
+
+  const handleConflictsResolved = useCallback(
+    async (decisions: ConflictDecision[]) => {
+      const pending = pendingConflicts;
+      setPendingConflicts(null);
+      if (!pending) return;
+      const skipIndices = pending.conflicts
+        .filter((_, i) => decisions[i] === 'skip')
+        .map((c) => c.idx);
+      await runStamp(pending.outputDir, skipIndices);
+    },
+    [pendingConflicts, runStamp],
+  );
 
   return (
     <div className="flex flex-col h-full gap-4">
@@ -288,6 +361,74 @@ export function StampControls(): React.JSX.Element {
         </div>
       </div>
 
+      {/* Rotation */}
+      <div className="space-y-1">
+        <div className="flex items-center justify-between">
+          <span className="text-xs text-gray-500">Rotation (deg, CCW)</span>
+          <button
+            type="button"
+            onClick={() => applyEdit(currentPdfId, { rotationDeg: 0 })}
+            className="text-xs text-blue-500 hover:underline"
+          >
+            Reset
+          </button>
+        </div>
+        <div className="flex items-center gap-2">
+          <input
+            type="range"
+            min={0}
+            max={360}
+            step={1}
+            value={rotationDeg}
+            onChange={(e) =>
+              applyEdit(currentPdfId, { rotationDeg: Number(e.target.value) })
+            }
+            className="flex-1"
+            aria-label="Stamp rotation slider"
+          />
+          <input
+            type="number"
+            min={0}
+            max={360}
+            step={1}
+            value={Math.round(rotationDeg)}
+            onChange={(e) =>
+              applyEdit(currentPdfId, { rotationDeg: Number(e.target.value) })
+            }
+            className="w-16 rounded-md border border-gray-300 px-2 py-1 text-sm"
+            aria-label="Stamp rotation degrees"
+          />
+        </div>
+        <div className="flex gap-2">
+          <button
+            type="button"
+            onClick={() =>
+              applyEdit(currentPdfId, {
+                rotationDeg: (rotationDeg - 90 + 360) % 360,
+              })
+            }
+            disabled={!currentPdfId}
+            aria-label="Rotate stamp 90 degrees clockwise"
+            className="flex-1 rounded-md border border-gray-300 px-2 py-1 text-xs text-gray-600 hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+          >
+            −90°
+          </button>
+          <button
+            type="button"
+            onClick={() =>
+              applyEdit(currentPdfId, {
+                rotationDeg: (rotationDeg + 90) % 360,
+              })
+            }
+            disabled={!currentPdfId}
+            aria-label="Rotate stamp 90 degrees counter-clockwise"
+            className="flex-1 rounded-md border border-gray-300 px-2 py-1 text-xs text-gray-600 hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+          >
+            +90°
+          </button>
+        </div>
+      </div>
+
       {/* Position info */}
       {isPlaced && (
         <div className="text-xs text-gray-400">
@@ -308,6 +449,13 @@ export function StampControls(): React.JSX.Element {
           ? `Exporting ${exportProgress.current}/${exportProgress.total}...`
           : `Apply to All (${files.length})`}
       </button>
+
+      {pendingConflicts && (
+        <ConflictDialog
+          conflicts={pendingConflicts.conflicts}
+          onDone={handleConflictsResolved}
+        />
+      )}
     </div>
   );
 }

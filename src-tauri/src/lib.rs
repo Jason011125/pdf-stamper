@@ -9,6 +9,7 @@ pub fn run() {
             commands::open_pdfs,
             commands::render_page,
             commands::read_file_bytes,
+            commands::check_output_conflicts,
             commands::stamp_pdfs,
         ])
         .run(tauri::generate_context!())

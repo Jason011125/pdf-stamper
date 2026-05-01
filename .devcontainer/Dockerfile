@@ -47,7 +47,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Allow the existing `node` user (UID 1000) to run iptables/ipset without
 # password, so the firewall init script can be invoked from postStartCommand.
-RUN echo "node ALL=(root) NOPASSWD: /usr/sbin/iptables, /usr/sbin/ipset, /usr/sbin/ip6tables, /usr/sbin/iptables-save, /usr/sbin/iptables-restore, /usr/sbin/ip" \
+# Also allow chown so post-create.sh can fix the named-volume mount point
+# at /workspace/node_modules (Docker initializes named volumes as root:root).
+RUN echo "node ALL=(root) NOPASSWD: /usr/sbin/iptables, /usr/sbin/ipset, /usr/sbin/ip6tables, /usr/sbin/iptables-save, /usr/sbin/iptables-restore, /usr/sbin/ip, /bin/chown" \
         > /etc/sudoers.d/node-firewall \
     && chmod 0440 /etc/sudoers.d/node-firewall
 

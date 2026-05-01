@@ -1,5 +1,6 @@
 import { useCallback, useRef } from 'react';
 import { usePdfStore } from '../stores/pdf-store';
+import { useStampStore } from '../stores/stamp-store';
 import { openPdfDialog, loadPdfs, renderPage } from '../services/pdf-bridge';
 
 const PREVIEW_WIDTH = 2000;
@@ -10,6 +11,15 @@ export function FileList(): React.JSX.Element {
   const addFiles = usePdfStore((s) => s.addFiles);
   const setSelectedIndex = usePdfStore((s) => s.setSelectedIndex);
   const removeFile = usePdfStore((s) => s.removeFile);
+  const clearOverride = useStampStore((s) => s.clearOverride);
+
+  const handleRemove = useCallback(
+    (pdfId: string) => {
+      removeFile(pdfId);
+      clearOverride(pdfId);
+    },
+    [removeFile, clearOverride],
+  );
 
   const isLoadingRef = useRef(false);
 
@@ -91,10 +101,11 @@ export function FileList(): React.JSX.Element {
             <button
               onClick={(e) => {
                 e.stopPropagation();
-                removeFile(index);
+                handleRemove(file.path);
               }}
-              className="text-gray-400 hover:text-red-500 transition-colors"
+              className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-gray-400 hover:bg-red-50 hover:text-red-500 transition-colors"
               title="Remove"
+              aria-label={`Remove ${file.filename}`}
             >
               &times;
             </button>
