@@ -183,6 +183,24 @@
       "priority": 11,
       "passes": true,
       "notes": "Diagnosis: traced every dialog/picker call. Export flow is already (1) selectOutputDir → open({directory:true}) ONCE → (2) checkOutputConflicts (IPC, no UI) → (3) setPendingConflicts → ConflictDialog renders → (4) buttons dispatch reducer (no IPC) → (5) useEffect[state] fires onDone(decisions) → (6) handleConflictsResolved unmounts dialog and calls runStamp → stampAllPdfs (IPC, no UI). No `open()` call exists anywhere on the conflict-dialog → onDone path; the prd's speculation about openPdfDialog was incorrect. The user's smoke-test report likely predates the current code or conflated step (1)'s directory picker with a file picker. Fix here is a regression-guard test: vi.mock('@tauri-apps/plugin-dialog'), render <ConflictDialog/> with 5 conflicts, click 'Overwrite all'/'Cancel all', assert onDone fired once with the expected decisions AND open mock never invoked. Also added single-button advance tests as bonus coverage. 68 vitest pass (was 64), tsc clean, no Rust changes."
+    },
+    {
+      "id": "US-R3",
+      "title": "Quick rotation buttons (+90 and -90) in stamp controls",
+      "description": "Add two quick-rotate buttons next to the existing rotation number input in stamp-controls.tsx. The +90° button rotates the stamp 90° CCW; the −90° button rotates 90° CW. Both must route through the same applyEdit path used by the existing rotation input so the master-vs-override rule (US-FIX1) is preserved.",
+      "acceptanceCriteria": [
+        "Two new buttons rendered in src/components/stamp-controls.tsx adjacent to the existing rotationDeg input. Label them clearly (e.g. '+90°' and '−90°' or use rotation icons).",
+        "+90° button: new rotationDeg = (current + 90) mod 360, applied via stamp-store's applyEdit(currentPdfId, { rotationDeg: ... }).",
+        "−90° button: new rotationDeg = (current - 90 + 360) mod 360, applied via the same applyEdit path.",
+        "Master-rule (US-FIX1) preserved: when currentPdfId === files[0]?.path, clicks update defaultConfig (so all unoverridden PDFs follow); on a non-master PDF, clicks update overrides[currentPdfId] only. Do NOT call setRotationDeg directly — that bypasses the master rule.",
+        "Buttons are disabled (or hidden) when no PDF is loaded (currentPdfId is empty), matching the disabled state of the existing rotation input.",
+        "Vitest in stamp-controls.test.tsx (or new file): (a) click +90° four times → rotationDeg back to original (mod 360 wrap), (b) click on master PDF propagates to all unoverridden PDFs in effective config, (c) click on non-master PDF only changes that PDF's effective config, (d) -90° from 0 yields 270.",
+        "tsc --noEmit and vitest run pass.",
+        "Manual verify recipe in commit body: load 3 PDFs → click +90° on PDF #1 (master) → all 3 previews rotate 90° → switch to PDF #2 → click -90° → only PDF #2 rotates back."
+      ],
+      "priority": 12,
+      "passes": false,
+      "notes": "Pure UI addition. No Rust changes. No bridge changes. The ONLY rule to watch is master-vs-override (US-FIX1) — buttons must route through applyEdit(currentPdfId, { rotationDeg }), NOT setRotationDeg. rotationDeg normalization (mod 360) is already handled inside stamp-store's normalizePartial, so callers can pass current+90 or current-90 directly without manual wrapping if they prefer — but explicit wrapping in the button handler is fine too and makes the test assertions cleaner."
     }
   ]
 }

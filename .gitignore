@@ -16,3 +16,9 @@ IMG_*.jpeg
 IMG_*.JPEG
 IMG_*.heic
 IMG_*.HEIC
+
+# Ralph runtime artifacts
+scripts/ralph/run-*.log
+
+# Per-user Claude Code config (project settings live in .claude/settings.json)
+.claude/settings.local.json
