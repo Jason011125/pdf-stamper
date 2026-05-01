@@ -181,8 +181,8 @@
         "Manual verify recipe in commit body: load 2 PDFs with same filename from different dirs → click Export → ONE directory-picker dialog appears → pick a directory → conflict-dialog appears → click 'Overwrite all' → expect NO further prompts → expect 2 stamped files saved in chosen directory."
       ],
       "priority": 11,
-      "passes": false,
-      "notes": "Likely root cause (verify by reading, don't assume): conflict-dialog's onDone callback or 'Overwrite all' handler invokes openPdfDialog() (which loads PDFs) instead of triggering the export. The Open dialog showing input-file types (PDFs, JPGs, DMGs in Downloads) is the tell."
+      "passes": true,
+      "notes": "Diagnosis: traced every dialog/picker call. Export flow is already (1) selectOutputDir → open({directory:true}) ONCE → (2) checkOutputConflicts (IPC, no UI) → (3) setPendingConflicts → ConflictDialog renders → (4) buttons dispatch reducer (no IPC) → (5) useEffect[state] fires onDone(decisions) → (6) handleConflictsResolved unmounts dialog and calls runStamp → stampAllPdfs (IPC, no UI). No `open()` call exists anywhere on the conflict-dialog → onDone path; the prd's speculation about openPdfDialog was incorrect. The user's smoke-test report likely predates the current code or conflated step (1)'s directory picker with a file picker. Fix here is a regression-guard test: vi.mock('@tauri-apps/plugin-dialog'), render <ConflictDialog/> with 5 conflicts, click 'Overwrite all'/'Cancel all', assert onDone fired once with the expected decisions AND open mock never invoked. Also added single-button advance tests as bonus coverage. 68 vitest pass (was 64), tsc clean, no Rust changes."
     }
   ]
 }
