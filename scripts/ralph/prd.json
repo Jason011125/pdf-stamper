@@ -131,6 +131,58 @@
       "priority": 8,
       "passes": true,
       "notes": "Rust commands::stamp_pdfs collapsed to a thin async wrapper around new pdf::run_stamp_jobs (non-async, testable). StampJob struct lives in pdf.rs (Deserialize + rename_all=camelCase). Image bytes are cached by image_path so repeated jobs with the same image read once. Frontend StampParams shape changed to { jobs: StampJob[]; outputDir; skipIndices? } — components iterate files and call getEffectiveConfig(f.path) per file to assemble jobs. Tests: pdf::run_stamp_jobs_applies_per_pdf_configs (3 PDFs with distinct (x,y,w,h,rotation) verified via parse_stamp_placement + corner-rotated-around-center geometry), pdf::run_stamp_jobs_respects_skip_indices, plus the rewritten pdf-bridge.test.ts 'jobs payload' describe block. All 34 cargo + 50 vitest pass."
+    },
+    {
+      "id": "US-FIX1",
+      "title": "Edits on the master (first) PDF must propagate to all unoverridden PDFs",
+      "description": "Reported by user during smoke test: dragging the stamp position on PDF #1 propagates to PDFs #2–#10 ✓ (because that's the *first* applyEdit, so it writes defaultConfig). But the next user action — adjusting rotation on PDF #1 — only changes #1 ❌, because applyEdit's 'first edit ever writes default; everything after writes override' rule routes the second+ edit to overrides[#1]. Replace this rule with an index-based rule: edits while the user is on the FIRST PDF in pdf-store's files (the 'master') write to defaultConfig; edits while on any other PDF write to that PDF's override.",
+      "acceptanceCriteria": [
+        "Remove the `hasBootstrappedDefault` flag from stamp-store.ts and the bootstrap branch in applyEdit.",
+        "Either: (a) keep applyEdit and have it read pdf-store inside (cross-store call: `usePdfStore.getState().files[0]?.path === pdfId` decides default-vs-override), OR (b) drop applyEdit entirely and have UI components (preview-pane, stamp-controls) inline the master check before calling setDefault or setOverride. Either is acceptable; pick the one that requires fewer test rewrites and document the choice in the commit body.",
+        "Behavioral invariant: applyEdit (or its replacement) on the master PDF writes to defaultConfig; on any other PDF writes to overrides[pdfId]. Master = files[0] in pdf-store.",
+        "When the master PDF is later removed (handled by US-FIX2), files[0] becomes the next PDF; subsequent edits on what is now files[0] write to default. No extra bookkeeping needed because the rule is purely index-based.",
+        "Update src/stores/stamp-store.test.ts: drop the `hasBootstrappedDefault` test, add tests for the new rule. Concretely: with 5 mock pdfIds ['a','b','c','d','e'] in pdf-store, editing on 'a' (master) writes default → all 5 effective configs reflect it; editing on 'c' (non-master) writes overrides['c'] only; after pdf-store removes 'a', editing on 'b' (now master) writes default.",
+        "Update existing UI tests if they relied on the old bootstrap behavior.",
+        "tsc --noEmit and vitest run pass.",
+        "Update the 'Per-PDF stamp config — override-on-edit rule' entry in scripts/ralph/progress.txt's Codebase Patterns section to reflect the new rule. Remove references to the deprecated bootstrap flag.",
+        "Manual verify recipe in commit body: load 5 PDFs → drag position on #1 (master) → expect all 5 to follow → adjust rotation on #1 → expect all 5 still to follow (this is the bug we're fixing) → switch to #3, drag → only #3 changes → switch back to #1, adjust size → all unoverridden follow, #3 stays."
+      ],
+      "priority": 9,
+      "passes": false,
+      "notes": "User mental model: 'PDF #1 is always master, others can be customized'. The previous 'first edit ever' rule was a misinterpretation. Current bug is reproducible: open 5 PDFs, drag position on PDF #1 (writes default, all 5 update — works), then change rotation on PDF #1 (writes overrides[#1], only #1 updates — bug)."
+    },
+    {
+      "id": "US-FIX2",
+      "title": "Fix unreliable X-button removal of PDFs from the file list",
+      "description": "Reported by user: clicking the X button on a loaded PDF in the left file list sometimes does not remove the PDF. Diagnose first, then fix. While there, also clean up two related concerns: removing a PDF must call useStampStore.getState().clearOverride(pdfId) so its override doesn't leak, and must URL.revokeObjectURL on its preview to avoid memory leak.",
+      "acceptanceCriteria": [
+        "Reproduce the bug first. Try removing PDFs at index 0, middle, last; one with a stamp-store override; the currently-selected one. Document what you found in the commit body.",
+        "Fix the root cause. Common suspects: (a) handler captured a stale array index, (b) removeFile in pdf-store doesn't actually mutate state, (c) click event swallowed by parent dialog/overlay, (d) selected-index out-of-bounds after removal preventing re-render.",
+        "Removal flow must: (1) call pdf-store's removeFile/equivalent on the correct pdfId, (2) call useStampStore.getState().clearOverride(pdfId), (3) URL.revokeObjectURL on the previewUrl if present.",
+        "If the removed PDF was currently selected, the new selection should be the first remaining PDF (or no selection if list empty).",
+        "Vitest tests: remove-first, remove-middle, remove-last, remove-only-one (list becomes empty), remove-with-override (override entry is gone from stamp-store), remove-currently-selected (selection updates).",
+        "tsc --noEmit and vitest run pass.",
+        "Manual verify recipe in commit body: load 5 PDFs, override #2 and #4 with distinct positions, remove each in turn (#5, #4, #3, #2, #1) and verify list shrinks correctly each time, no stale overrides remain, selection moves sensibly."
+      ],
+      "priority": 10,
+      "passes": false,
+      "notes": "X-button handler is in src/components/file-list.tsx; pdf-store's removal logic in src/stores/pdf-store.ts. Don't speculate fixes — reproduce first."
+    },
+    {
+      "id": "US-FIX3",
+      "title": "Fix conflict-dialog flow: file picker should not appear after 'Overwrite all'",
+      "description": "Reported by user: when clicking 'Overwrite all' (or 'Cancel all') in the conflict dialog, a macOS file Open dialog appears (not a save dialog, not a directory picker — a *file* Open dialog showing files in Downloads). Expected flow: pick output directory ONCE before checkOutputConflicts → walk conflicts via dialog → on completion, stampAllPdfs runs without further prompts.",
+      "acceptanceCriteria": [
+        "Diagnose first. Read stamp-controls.tsx and conflict-dialog.tsx. List every dialog/picker call (open(), save(), confirm()). Document the current order in the commit body. Specifically check: is openPdfDialog() (the input-file picker, used to load PDFs) being invoked from a conflict-dialog button handler by mistake? The user's screenshot shows a file Open dialog listing files in Downloads — that's the file picker for input PDFs, which strongly suggests this is the bug.",
+        "Re-order or fix the flow so it is: (1) Export click → (2) plugin-dialog `open({ directory: true })` picks output dir ONCE → (3) checkOutputConflicts(inputs, outputDir, suffix) → (4) if conflicts: render <ConflictDialog/> with 4 buttons; user makes decisions → (5) on dialog completion, stampAllPdfs(jobs, outputDir, skipIndices) → (6) success toast.",
+        "'Overwrite all' and 'Cancel all' buttons MUST NOT trigger any open()/save()/dialog. They only update the conflict reducer state and dispatch the final stampAllPdfs call.",
+        "Vitest: extend conflict-dialog.test.tsx — using @testing-library/react, mount the dialog with 5 mock conflicts, simulate clicking 'Overwrite all', assert onDone is called with ['overwrite','overwrite','overwrite','overwrite','overwrite'] AND that no Tauri open() / dialog mock is invoked between click and onDone. Same for 'Cancel all' yielding 5 'skip'.",
+        "tsc --noEmit and vitest run pass.",
+        "Manual verify recipe in commit body: load 2 PDFs with same filename from different dirs → click Export → ONE directory-picker dialog appears → pick a directory → conflict-dialog appears → click 'Overwrite all' → expect NO further prompts → expect 2 stamped files saved in chosen directory."
+      ],
+      "priority": 11,
+      "passes": false,
+      "notes": "Likely root cause (verify by reading, don't assume): conflict-dialog's onDone callback or 'Overwrite all' handler invokes openPdfDialog() (which loads PDFs) instead of triggering the export. The Open dialog showing input-file types (PDFs, JPGs, DMGs in Downloads) is the tell."
     }
   ]
 }
