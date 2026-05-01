@@ -148,8 +148,8 @@
         "Manual verify recipe in commit body: load 5 PDFs → drag position on #1 (master) → expect all 5 to follow → adjust rotation on #1 → expect all 5 still to follow (this is the bug we're fixing) → switch to #3, drag → only #3 changes → switch back to #1, adjust size → all unoverridden follow, #3 stays."
       ],
       "priority": 9,
-      "passes": false,
-      "notes": "User mental model: 'PDF #1 is always master, others can be customized'. The previous 'first edit ever' rule was a misinterpretation. Current bug is reproducible: open 5 PDFs, drag position on PDF #1 (writes default, all 5 update — works), then change rotation on PDF #1 (writes overrides[#1], only #1 updates — bug)."
+      "passes": true,
+      "notes": "Approach (a): kept applyEdit, added cross-store read of usePdfStore.getState().files[0]?.path. Master = files[0]; rule is purely index-based, no flag. applyEdit is also a no-op when pdfId is empty (covers 'no PDFs loaded yet'). Removed hasBootstrappedDefault from store + interface + test reset. Tests rewritten in stamp-store.test.ts under 'master-index rule (US-FIX1)' — covers all AC scenarios incl. the regression (repeated master edits stay on default) and post-removal master promotion. Pattern entry in progress.txt updated."
     },
     {
       "id": "US-FIX2",

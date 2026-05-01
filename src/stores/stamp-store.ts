@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { usePdfStore } from './pdf-store';
 
 export type StampType = 'image' | 'text';
 
@@ -59,12 +60,6 @@ function normalizePartial(partial: Partial<StampConfig>): Partial<StampConfig> {
 interface StampStore {
   defaultConfig: StampConfig;
   overrides: Record<string, Partial<StampConfig>>;
-  /** True after the very first applyEdit call. The first edit is the
-   * "bootstrap" — it writes to defaultConfig (so every loaded PDF inherits
-   * it). Every subsequent applyEdit routes to overrides[pdfId] instead.
-   * UI components must use applyEdit (never setDefault) for position/size/
-   * rotation edits so this rule has exactly one enforcement point. */
-  hasBootstrappedDefault: boolean;
 
   isPlaced: boolean;
   isExporting: boolean;
@@ -77,18 +72,20 @@ interface StampStore {
   setDefault: (partial: Partial<StampConfig>) => void;
   setOverride: (pdfId: string, partial: Partial<StampConfig>) => void;
   clearOverride: (pdfId: string) => void;
-  /** Routes a position/size/rotation edit from the UI: the first call writes
-   * to defaultConfig (bootstrap; flips hasBootstrappedDefault), every later
-   * call writes to overrides[pdfId]. Keeps the bootstrap rule out of the
-   * components — they just call applyEdit(currentPdfId, partial). */
+  /** Routes a position/size/rotation edit from the UI. Uses a purely
+   * index-based rule: edits on the master PDF (files[0] in pdf-store) write
+   * to defaultConfig; edits on any other PDF write to overrides[pdfId].
+   * If `pdfId` is empty (no PDFs loaded), the call is a no-op. Keeps the
+   * default-vs-override decision in one place so components stay mechanical. */
   applyEdit: (pdfId: string, partial: Partial<StampConfig>) => void;
 
   setPlaced: (placed: boolean) => void;
   setExporting: (exporting: boolean) => void;
   setExportProgress: (current: number, total: number) => void;
 
-  // Backcompat shim — these write to defaultConfig. UI components will be
-  // migrated to setOverride(currentPdfId, ...) in US-P2.
+  // Shim setters — write to defaultConfig. Used for global stamp setup
+  // (image / text / color / font / lockAspect) where per-PDF overrides don't
+  // make sense. Per-PDF position/size/rotation edits go through applyEdit.
   setType: (type: StampType) => void;
   setImage: (path: string, previewUrl: string) => void;
   clearImage: () => void;
@@ -106,7 +103,6 @@ interface StampStore {
 export const useStampStore = create<StampStore>((set, get) => ({
   defaultConfig: { ...DEFAULT_STAMP_CONFIG },
   overrides: {},
-  hasBootstrappedDefault: false,
   isPlaced: false,
   isExporting: false,
   exportProgress: { current: 0, total: 0 },
@@ -143,11 +139,12 @@ export const useStampStore = create<StampStore>((set, get) => ({
 
   applyEdit: (pdfId, partial) =>
     set((state) => {
+      if (!pdfId) return state;
       const normalized = normalizePartial(partial);
-      if (!state.hasBootstrappedDefault) {
+      const masterId = usePdfStore.getState().files[0]?.path;
+      if (pdfId === masterId) {
         return {
           defaultConfig: { ...state.defaultConfig, ...normalized },
-          hasBootstrappedDefault: true,
         };
       }
       return {

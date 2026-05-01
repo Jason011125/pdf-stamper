@@ -4,13 +4,25 @@ import {
   DEFAULT_STAMP_CONFIG,
   type StampConfig,
 } from './stamp-store';
+import { usePdfStore, type PdfFile } from './pdf-store';
 
 function reset(): void {
   useStampStore.setState({
     defaultConfig: { ...DEFAULT_STAMP_CONFIG },
     overrides: {},
-    hasBootstrappedDefault: false,
   });
+  usePdfStore.setState({ files: [], selectedIndex: 0 });
+}
+
+function loadPdfs(ids: string[]): void {
+  const files: PdfFile[] = ids.map((id) => ({
+    path: id,
+    filename: id,
+    widthPt: 612,
+    heightPt: 792,
+    previewUrl: null,
+  }));
+  usePdfStore.setState({ files, selectedIndex: 0 });
 }
 
 describe('stamp-store rotationDeg (via setRotationDeg shim → setDefault)', () => {
@@ -162,23 +174,18 @@ describe('stamp-store model A — defaultConfig + per-PDF overrides', () => {
   });
 });
 
-describe('stamp-store applyEdit — override-on-edit (US-P2)', () => {
+describe('stamp-store applyEdit — master-index rule (US-FIX1)', () => {
   beforeEach(reset);
 
-  const PDF_IDS = ['p0', 'p1', 'p2', 'p3', 'p4'];
+  const PDF_IDS = ['a', 'b', 'c', 'd', 'e'];
 
-  it('starts with hasBootstrappedDefault=false', () => {
-    expect(useStampStore.getState().hasBootstrappedDefault).toBe(false);
-  });
+  // Rule (a): edits on the master PDF (files[0] in pdf-store) write to
+  // defaultConfig — every unoverridden PDF inherits the change.
+  it('applyEdit on the master PDF writes default → all unoverridden PDFs inherit', () => {
+    loadPdfs(PDF_IDS);
+    useStampStore.getState().applyEdit('a', { xPt: 100, yPt: 200 });
 
-  // (a) From the AC: first edit on PDF 0 → all 5 effective configs match
-  // because the bootstrap call writes to defaultConfig.
-  it('first applyEdit writes default → every PDF inherits the change', () => {
-    useStampStore.getState().applyEdit('p0', { xPt: 100, yPt: 200 });
-
-    expect(useStampStore.getState().hasBootstrappedDefault).toBe(true);
     expect(useStampStore.getState().overrides).toEqual({});
-
     for (const id of PDF_IDS) {
       const eff = useStampStore.getState().getEffectiveConfig(id);
       expect(eff.xPt).toBe(100);
@@ -186,70 +193,91 @@ describe('stamp-store applyEdit — override-on-edit (US-P2)', () => {
     }
   });
 
-  // (b) From the AC: after the bootstrap, an edit on PDF 2 → only PDF 2 shifts.
-  it('subsequent applyEdit writes overrides[pdfId] → only that PDF shifts', () => {
-    useStampStore.getState().applyEdit('p0', { xPt: 100, yPt: 200 });
-    useStampStore.getState().applyEdit('p2', { xPt: 333, yPt: 444 });
+  // The headline regression from the bug report: a second edit on the master
+  // PDF (e.g. dragging position then changing rotation) must keep writing to
+  // default so all unoverridden PDFs follow. The old bootstrap rule routed the
+  // second edit to overrides[master] — that's exactly the bug US-FIX1 fixes.
+  it('repeated applyEdits on master keep writing default (the FIX1 regression)', () => {
+    loadPdfs(PDF_IDS);
+    useStampStore.getState().applyEdit('a', { xPt: 100, yPt: 200 });
+    useStampStore.getState().applyEdit('a', { rotationDeg: 45 });
+    useStampStore.getState().applyEdit('a', { widthPt: 250 });
+
+    expect(useStampStore.getState().overrides).toEqual({});
+    for (const id of PDF_IDS) {
+      const eff = useStampStore.getState().getEffectiveConfig(id);
+      expect(eff.xPt).toBe(100);
+      expect(eff.yPt).toBe(200);
+      expect(eff.rotationDeg).toBe(45);
+      expect(eff.widthPt).toBe(250);
+    }
+  });
+
+  // Rule (b): edits on a non-master PDF write to overrides[pdfId] only.
+  it('applyEdit on a non-master PDF writes overrides[pdfId] → only that PDF shifts', () => {
+    loadPdfs(PDF_IDS);
+    useStampStore.getState().applyEdit('a', { xPt: 100, yPt: 200 });
+    useStampStore.getState().applyEdit('c', { xPt: 333, yPt: 444 });
 
     expect(useStampStore.getState().overrides).toEqual({
-      p2: { xPt: 333, yPt: 444 },
+      c: { xPt: 333, yPt: 444 },
     });
 
-    expect(useStampStore.getState().getEffectiveConfig('p0').xPt).toBe(100);
-    expect(useStampStore.getState().getEffectiveConfig('p1').xPt).toBe(100);
-    expect(useStampStore.getState().getEffectiveConfig('p2').xPt).toBe(333);
-    expect(useStampStore.getState().getEffectiveConfig('p2').yPt).toBe(444);
-    expect(useStampStore.getState().getEffectiveConfig('p3').xPt).toBe(100);
-    expect(useStampStore.getState().getEffectiveConfig('p4').xPt).toBe(100);
+    expect(useStampStore.getState().getEffectiveConfig('a').xPt).toBe(100);
+    expect(useStampStore.getState().getEffectiveConfig('b').xPt).toBe(100);
+    expect(useStampStore.getState().getEffectiveConfig('c').xPt).toBe(333);
+    expect(useStampStore.getState().getEffectiveConfig('c').yPt).toBe(444);
+    expect(useStampStore.getState().getEffectiveConfig('d').xPt).toBe(100);
+    expect(useStampStore.getState().getEffectiveConfig('e').xPt).toBe(100);
   });
 
-  // (c) From the AC: setDefault again → unoverridden PDFs follow, overridden PDF stays.
-  it('setDefault after an override flows to unoverridden PDFs only', () => {
-    useStampStore.getState().applyEdit('p0', { xPt: 100, yPt: 200 });
-    useStampStore.getState().applyEdit('p2', { xPt: 333, yPt: 444 });
+  // After the master is removed (e.g. via X-button in the file list, see
+  // US-FIX2) files[0] becomes the next PDF; subsequent edits on what is now
+  // files[0] write to default. No extra bookkeeping.
+  it('master is purely files[0] — removing the master promotes the next PDF', () => {
+    loadPdfs(PDF_IDS);
+    useStampStore.getState().applyEdit('a', { xPt: 100 });
+    expect(useStampStore.getState().defaultConfig.xPt).toBe(100);
 
-    useStampStore.getState().setDefault({ xPt: 999, yPt: 888 });
+    // Drop 'a'; 'b' becomes the new master.
+    loadPdfs(['b', 'c', 'd', 'e']);
 
-    expect(useStampStore.getState().getEffectiveConfig('p0').xPt).toBe(999);
-    expect(useStampStore.getState().getEffectiveConfig('p1').xPt).toBe(999);
-    expect(useStampStore.getState().getEffectiveConfig('p2').xPt).toBe(333); // override wins
-    expect(useStampStore.getState().getEffectiveConfig('p2').yPt).toBe(444); // override wins
-    expect(useStampStore.getState().getEffectiveConfig('p3').xPt).toBe(999);
-    expect(useStampStore.getState().getEffectiveConfig('p4').xPt).toBe(999);
+    useStampStore.getState().applyEdit('b', { xPt: 250 });
+    expect(useStampStore.getState().defaultConfig.xPt).toBe(250);
+    expect(useStampStore.getState().overrides).toEqual({});
+
+    // Editing 'c' (non-master) again routes to override.
+    useStampStore.getState().applyEdit('c', { xPt: 700 });
+    expect(useStampStore.getState().overrides).toEqual({ c: { xPt: 700 } });
   });
 
-  // Subsequent edits to the *same* PDF that received the bootstrap go to that
-  // PDF's override (the bootstrap rule is global, not per-PDF). This is the
-  // gotcha the AC notes ("first edit goes to default; subsequent edits on the
-  // same PDF go to its override").
-  it('second applyEdit on the bootstrap PDF writes its override, not default', () => {
-    useStampStore.getState().applyEdit('p0', { xPt: 100 });
-    useStampStore.getState().applyEdit('p0', { xPt: 200 });
-
-    expect(useStampStore.getState().defaultConfig.xPt).toBe(100); // bootstrap value
-    expect(useStampStore.getState().overrides.p0).toEqual({ xPt: 200 });
-    expect(useStampStore.getState().getEffectiveConfig('p0').xPt).toBe(200);
-
-    // Other PDFs still see the bootstrap value
-    expect(useStampStore.getState().getEffectiveConfig('p1').xPt).toBe(100);
-  });
-
-  it('applyEdit normalizes rotationDeg in both bootstrap and override paths', () => {
-    useStampStore.getState().applyEdit('p0', { rotationDeg: -30 });
+  it('applyEdit normalizes rotationDeg on both master and non-master paths', () => {
+    loadPdfs(PDF_IDS);
+    useStampStore.getState().applyEdit('a', { rotationDeg: -30 });
     expect(useStampStore.getState().defaultConfig.rotationDeg).toBe(330);
 
-    useStampStore.getState().applyEdit('p1', { rotationDeg: 450 });
-    expect(useStampStore.getState().getEffectiveConfig('p1').rotationDeg).toBe(90);
+    useStampStore.getState().applyEdit('b', { rotationDeg: 450 });
+    expect(useStampStore.getState().getEffectiveConfig('b').rotationDeg).toBe(90);
+    expect(useStampStore.getState().overrides.b).toEqual({ rotationDeg: 90 });
   });
 
   it('applyEdit shallow-merges into an existing override entry', () => {
-    useStampStore.getState().applyEdit('p0', { xPt: 0 }); // bootstrap (drains the flag)
-    useStampStore.getState().applyEdit('p1', { xPt: 100, yPt: 50 });
-    useStampStore.getState().applyEdit('p1', { yPt: 75 });
+    loadPdfs(PDF_IDS);
+    useStampStore.getState().applyEdit('b', { xPt: 100, yPt: 50 });
+    useStampStore.getState().applyEdit('b', { yPt: 75 });
 
-    expect(useStampStore.getState().overrides.p1).toEqual({
+    expect(useStampStore.getState().overrides.b).toEqual({
       xPt: 100,
       yPt: 75,
     });
+  });
+
+  it('applyEdit with empty pdfId is a no-op (no PDFs loaded yet)', () => {
+    // No loadPdfs call; files[] is empty.
+    useStampStore.getState().applyEdit('', { xPt: 100 });
+    expect(useStampStore.getState().defaultConfig.xPt).toBe(
+      DEFAULT_STAMP_CONFIG.xPt,
+    );
+    expect(useStampStore.getState().overrides).toEqual({});
   });
 });
