@@ -8,6 +8,13 @@ cd /workspace
 echo "→ Installing pdfium (via scripts/setup-pdfium.sh)..."
 bash scripts/setup-pdfium.sh
 
+# /workspace/node_modules is a Docker named volume (see devcontainer.json).
+# Docker initializes it root:root on first mount; fix ownership so npm
+# (running as `node`) can write to it. NOPASSWD chown is granted in the
+# Dockerfile sudoers rule.
+echo "→ Fixing /workspace/node_modules ownership (Docker volume init)..."
+sudo /bin/chown node:node /workspace/node_modules
+
 echo "→ npm ci..."
 npm ci
 
