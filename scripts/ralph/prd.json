@@ -165,8 +165,8 @@
         "Manual verify recipe in commit body: load 5 PDFs, override #2 and #4 with distinct positions, remove each in turn (#5, #4, #3, #2, #1) and verify list shrinks correctly each time, no stale overrides remain, selection moves sensibly."
       ],
       "priority": 10,
-      "passes": false,
-      "notes": "X-button handler is in src/components/file-list.tsx; pdf-store's removal logic in src/stores/pdf-store.ts. Don't speculate fixes — reproduce first."
+      "passes": true,
+      "notes": "Two issues found: (1) tiny X-button hit target (just the &times; glyph, no padding) — misclicks land on the row's onClick (setSelectedIndex) instead, looking like 'didn't remove'. (2) removeFile didn't clearOverride or apply the AC's 'first remaining PDF' selection rule. Fixed: removeFile now takes a pdfId (string) — looked up via findIndex on path — eliminating any stale-index risk; FileList orchestrates removeFile + clearOverride in a handleRemove helper (avoids cycle between pdf-store and stamp-store); X-button is now h-6 w-6 with hover bg for an obvious target. Selection rule: removed=selected → goto 0; removed before selected → decrement; removed after selected → unchanged. New tests in src/stores/pdf-store.test.ts (14) cover all AC scenarios incl. the cross-store flow."
     },
     {
       "id": "US-FIX3",
