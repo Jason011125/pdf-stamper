@@ -814,8 +814,9 @@ pub fn parse_hex_color(hex: &str) -> Option<(f32, f32, f32)> {
 }
 
 /// Build a proper image XObject from raw image file bytes (PNG, JPEG, etc.).
-/// Handles RGBA by stripping alpha (or using SMask) and always produces
-/// a valid DeviceRGB or DeviceGray XObject.
+/// Handles RGBA by emitting a separate DeviceGray /SMask carrying the alpha
+/// channel, so transparent pixels composite against the page rather than
+/// showing through as the PNG's stored RGB (which is usually black).
 fn create_image_xobject(
     doc: &mut Document,
     file_bytes: &[u8],
@@ -839,14 +840,27 @@ fn create_image_xobject(
         return Ok(doc.add_object(stream));
     }
 
-    // For PNG and other formats: decode, convert to RGB8, compress with Flate
+    // For PNG and other formats: decode and check for alpha
     let img = image::load_from_memory(file_bytes)
         .map_err(|e| PdfError::StampError(e.to_string()))?;
     let (w, h) = img.dimensions();
+    let has_alpha = img.color().has_alpha();
 
-    // Convert to RGB (strips alpha if present)
-    let rgb_img = img.to_rgb8();
-    let rgb_bytes = rgb_img.into_raw();
+    let (rgb_bytes, alpha_bytes) = if has_alpha {
+        let rgba = img.to_rgba8();
+        let pixel_count = (w as usize) * (h as usize);
+        let mut rgb = Vec::with_capacity(pixel_count * 3);
+        let mut alpha = Vec::with_capacity(pixel_count);
+        for px in rgba.pixels() {
+            rgb.push(px[0]);
+            rgb.push(px[1]);
+            rgb.push(px[2]);
+            alpha.push(px[3]);
+        }
+        (rgb, Some(alpha))
+    } else {
+        (img.to_rgb8().into_raw(), None)
+    };
 
     let mut dict = Dictionary::new();
     dict.set("Type", Name(b"XObject".to_vec()));
@@ -855,6 +869,22 @@ fn create_image_xobject(
     dict.set("Height", Object::Integer(h as i64));
     dict.set("ColorSpace", Name(b"DeviceRGB".to_vec()));
     dict.set("BitsPerComponent", Object::Integer(8));
+
+    if let Some(alpha) = alpha_bytes {
+        let mut smask_dict = Dictionary::new();
+        smask_dict.set("Type", Name(b"XObject".to_vec()));
+        smask_dict.set("Subtype", Name(b"Image".to_vec()));
+        smask_dict.set("Width", Object::Integer(w as i64));
+        smask_dict.set("Height", Object::Integer(h as i64));
+        smask_dict.set("ColorSpace", Name(b"DeviceGray".to_vec()));
+        smask_dict.set("BitsPerComponent", Object::Integer(8));
+        let mut smask_stream = Stream::new(smask_dict, alpha);
+        smask_stream
+            .compress()
+            .map_err(|e| PdfError::StampError(e.to_string()))?;
+        let smask_id = doc.add_object(smask_stream);
+        dict.set("SMask", Object::Reference(smask_id));
+    }
 
     let mut stream = Stream::new(dict, rgb_bytes);
     stream
@@ -1787,6 +1817,153 @@ mod tests {
         }
         assert!(x_min != u32::MAX, "no red pixels found in rendered output");
         ((x_min, x_max), (y_min, y_max))
+    }
+
+    /// Walk a PDF and return all Image XObjects keyed by ObjectId. Used by
+    /// structural assertions about the stamp's image XObject + its /SMask.
+    fn collect_image_xobjects(doc: &Document) -> Vec<(lopdf::ObjectId, Dictionary)> {
+        let mut out = Vec::new();
+        for (id, obj) in &doc.objects {
+            if let Object::Stream(s) = obj {
+                if let Ok(Name(n)) = s.dict.get(b"Subtype") {
+                    if n == b"Image" {
+                        out.push((*id, s.dict.clone()));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Asserts that a stamped PDF's image XObject carries a structurally
+    /// correct /SMask: a DeviceGray, 8-bit Image XObject with the same
+    /// width/height as the parent. This catches the "we dropped alpha again"
+    /// regression at the PDF-object level, without needing pdfium to render.
+    fn assert_stamped_pdf_has_alpha_smask(pdf_bytes: &[u8]) {
+        let doc = Document::load_mem(pdf_bytes).expect("parse stamped pdf");
+        let images = collect_image_xobjects(&doc);
+        // The stamp produces exactly two Image XObjects: the main RGB image
+        // and its DeviceGray SMask.
+        assert_eq!(
+            images.len(), 2,
+            "expected 2 Image XObjects (main + SMask), got {}", images.len()
+        );
+
+        // The main image is the one carrying /SMask.
+        let (_, main_dict) = images.iter().find(|(_, d)| d.get(b"SMask").is_ok())
+            .expect("no Image XObject has /SMask — alpha was dropped");
+
+        let smask_id = match main_dict.get(b"SMask").unwrap() {
+            Object::Reference(id) => *id,
+            other => panic!("/SMask must be an indirect reference, got {:?}", other),
+        };
+        let smask_stream = doc.get_object(smask_id).unwrap().as_stream().unwrap();
+        let smask = &smask_stream.dict;
+
+        let smask_subtype = smask.get(b"Subtype").unwrap().as_name().unwrap();
+        assert_eq!(smask_subtype, b"Image", "SMask must be an Image XObject");
+
+        let smask_cs = smask.get(b"ColorSpace").unwrap().as_name().unwrap();
+        assert_eq!(smask_cs, b"DeviceGray", "SMask color space must be DeviceGray");
+
+        let smask_bpc = smask.get(b"BitsPerComponent").unwrap().as_i64().unwrap();
+        assert_eq!(smask_bpc, 8, "SMask must be 8 bits per component");
+
+        let main_w = main_dict.get(b"Width").unwrap().as_i64().unwrap();
+        let main_h = main_dict.get(b"Height").unwrap().as_i64().unwrap();
+        let smask_w = smask.get(b"Width").unwrap().as_i64().unwrap();
+        let smask_h = smask.get(b"Height").unwrap().as_i64().unwrap();
+        assert_eq!(
+            (smask_w, smask_h), (main_w, main_h),
+            "SMask dimensions must match parent image"
+        );
+    }
+
+    /// Asserts that a stamped PDF's image XObject has NO /SMask — i.e. the
+    /// source image had no alpha and we didn't waste bytes on a useless mask.
+    fn assert_stamped_pdf_has_no_smask(pdf_bytes: &[u8]) {
+        let doc = Document::load_mem(pdf_bytes).expect("parse stamped pdf");
+        let images = collect_image_xobjects(&doc);
+        assert_eq!(
+            images.len(), 1,
+            "opaque-source stamp must produce exactly 1 Image XObject, got {}",
+            images.len()
+        );
+        assert!(
+            images[0].1.get(b"SMask").is_err(),
+            "opaque-source stamp must not emit /SMask"
+        );
+    }
+
+    /// Build a PNG with a red square in the top-left quadrant on an otherwise
+    /// fully-transparent canvas. The transparent pixels carry RGB=(0,0,0) —
+    /// which is exactly what trips `to_rgb8()` into producing a black halo
+    /// when the alpha channel is dropped without an SMask.
+    fn make_red_square_on_transparent_png(canvas: u32, square: u32) -> Vec<u8> {
+        let img = image::RgbaImage::from_fn(canvas, canvas, |x, y| {
+            if x < square && y < square {
+                image::Rgba([255, 0, 0, 255])
+            } else {
+                image::Rgba([0, 0, 0, 0])
+            }
+        });
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+            .unwrap();
+        bytes
+    }
+
+    #[test]
+    fn stamp_image_transparent_png_does_not_paint_black_background() {
+        // 100x100 PNG, red 50x50 in the top-left quadrant, rest fully transparent.
+        let pdf = make_test_pdf(600.0, 800.0, None);
+        let png = make_red_square_on_transparent_png(100, 50);
+
+        // Stamp display rect: x=[200,400], y=[300,500] (PDF bottom-left origin).
+        // Source image is upright in display (top-left sample → display TL),
+        // so the red square covers display (200..300, 400..500); the rest of
+        // the rect is transparent and must show the page-white underneath.
+        let (dx, dy, w, h) = (200.0_f32, 300.0_f32, 200.0_f32, 200.0_f32);
+        let stamped = stamp_image(&pdf, &png, dx, dy, w, h, 0.0).unwrap();
+
+        // Structural assertion: catches "we dropped alpha again" regressions
+        // without depending on pdfium's render output.
+        assert_stamped_pdf_has_alpha_smask(&stamped);
+
+        let target_w = 600u16;
+        let rendered = render_page_to_png(&stamped, target_w).unwrap();
+        let img = image::load_from_memory(&rendered).unwrap().to_rgba8();
+        let scale = target_w as f32 / 600.0;
+        let render_h = 800.0 * scale;
+
+        // Probe the BR quadrant of the stamp rect — fully transparent in source.
+        let probe_x = (350.0 * scale) as u32;
+        let probe_y = (render_h - 350.0 * scale) as u32;
+        let p = img.get_pixel(probe_x, probe_y);
+        assert!(
+            p[0] > 200 && p[1] > 200 && p[2] > 200,
+            "transparent stamp area should show page-white, got {:?} at ({}, {})",
+            p, probe_x, probe_y
+        );
+
+        // Sanity check: the red square itself still renders red.
+        let red_x = (250.0 * scale) as u32;
+        let red_y = (render_h - 450.0 * scale) as u32;
+        let r = img.get_pixel(red_x, red_y);
+        assert!(
+            r[0] > 200 && r[1] < 80 && r[2] < 80,
+            "red square should still render red, got {:?}", r
+        );
+    }
+
+    #[test]
+    fn stamp_image_opaque_png_does_not_emit_smask() {
+        // Opaque-source stamps shouldn't pay for a no-op alpha mask.
+        let pdf = make_test_pdf(600.0, 800.0, None);
+        let png = make_solid_red_png(50, 50); // RGB, no alpha channel
+        let stamped = stamp_image(&pdf, &png, 100.0, 100.0, 50.0, 50.0, 0.0).unwrap();
+        assert_stamped_pdf_has_no_smask(&stamped);
     }
 
     #[test]
