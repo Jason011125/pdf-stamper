@@ -73,6 +73,8 @@ export function StampControls(): React.JSX.Element {
   const applyEdit = useStampStore((s) => s.applyEdit);
   const isPlaced = useStampStore((s) => s.isPlaced);
   const isExporting = useStampStore((s) => s.isExporting);
+  const flatten = useStampStore((s) => s.flatten);
+  const setFlatten = useStampStore((s) => s.setFlatten);
   const setExporting = useStampStore((s) => s.setExporting);
   const exportProgress = useStampStore((s) => s.exportProgress);
   const setExportProgress = useStampStore((s) => s.setExportProgress);
@@ -194,6 +196,7 @@ export function StampControls(): React.JSX.Element {
           jobs,
           outputDir,
           skipIndices: skipIndices.length > 0 ? skipIndices : undefined,
+          flatten,
         });
         setExportProgress(result.length, files.length);
       } catch (err) {
@@ -203,7 +206,7 @@ export function StampControls(): React.JSX.Element {
         setExporting(false);
       }
     },
-    [files, getEffectiveConfig, setExporting, setExportProgress],
+    [files, getEffectiveConfig, setExporting, setExportProgress, flatten],
   );
 
   const handleApplyAll = useCallback(async () => {
@@ -435,6 +438,20 @@ export function StampControls(): React.JSX.Element {
 
       {/* Spacer */}
       <div className="flex-1" />
+
+      {/* Flatten toggle */}
+      <label className="flex items-start gap-2 text-xs text-gray-600 cursor-pointer select-none">
+        <input
+          type="checkbox"
+          checked={flatten}
+          onChange={(e) => setFlatten(e.target.checked)}
+          disabled={isExporting}
+          className="mt-0.5 cursor-pointer disabled:cursor-not-allowed"
+        />
+        <span>
+          Flatten output (stamp becomes uneditable)
+        </span>
+      </label>
 
       {/* Apply button */}
       <button

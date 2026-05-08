@@ -76,16 +76,25 @@ describe('stampAllPdfs jobs payload', () => {
   const baseParams = {
     jobs: [baseJob, { ...baseJob, path: '/b.pdf' }],
     outputDir: '/out',
+    flatten: false,
   };
 
-  it('forwards jobs and outputDir to stamp_pdfs (camelCase keys)', async () => {
+  it('forwards jobs/outputDir/flatten to stamp_pdfs (camelCase keys)', async () => {
     invokeMock.mockResolvedValueOnce([]);
     await stampAllPdfs(baseParams);
     expect(invokeMock).toHaveBeenCalledWith('stamp_pdfs', {
       jobs: baseParams.jobs,
       outputDir: '/out',
       skipIndices: undefined,
+      flatten: false,
     });
+  });
+
+  it('forwards flatten=true verbatim', async () => {
+    invokeMock.mockResolvedValueOnce([]);
+    await stampAllPdfs({ ...baseParams, flatten: true });
+    const args = invokeMock.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(args.flatten).toBe(true);
   });
 
   it('forwards skipIndices when provided', async () => {
@@ -112,7 +121,7 @@ describe('stampAllPdfs jobs payload', () => {
       { ...baseJob, path: '/a.pdf', rotationDeg: 90 },
       { ...baseJob, path: '/b.pdf', rotationDeg: 180 },
     ];
-    await stampAllPdfs({ jobs, outputDir: '/out' });
+    await stampAllPdfs({ jobs, outputDir: '/out', flatten: false });
     const call = invokeMock.mock.calls[0];
     const args = call?.[1] as Record<string, unknown> | undefined;
     const sentJobs = args?.jobs as Array<Record<string, unknown>>;
@@ -126,7 +135,7 @@ describe('stampAllPdfs jobs payload', () => {
       { ...baseJob, path: '/a.pdf', x: 10, y: 20 },
       { ...baseJob, path: '/b.pdf', x: 300, y: 400 },
     ];
-    await stampAllPdfs({ jobs, outputDir: '/out' });
+    await stampAllPdfs({ jobs, outputDir: '/out', flatten: false });
     const args = invokeMock.mock.calls[0]?.[1] as Record<string, unknown>;
     const sentJobs = args.jobs as Array<Record<string, unknown>>;
     expect(sentJobs[0]?.x).toBe(10);

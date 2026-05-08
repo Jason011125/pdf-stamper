@@ -83,6 +83,11 @@ export interface StampParams {
   jobs: StampJob[];
   outputDir: string;
   skipIndices?: number[];
+  /** When true, the Rust side rasterizes each stamped page at high DPI and
+   * writes a fresh single-page PDF whose only content is that JPEG. The
+   * stamp ends up baked into pixels so editors like WPS PDF Edit can no
+   * longer manipulate it. */
+  flatten: boolean;
 }
 
 export async function stampAllPdfs(params: StampParams): Promise<string[]> {
@@ -90,5 +95,6 @@ export async function stampAllPdfs(params: StampParams): Promise<string[]> {
     jobs: params.jobs,
     outputDir: params.outputDir,
     skipIndices: params.skipIndices,
+    flatten: params.flatten,
   });
 }

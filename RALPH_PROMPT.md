@@ -100,16 +100,18 @@ Rust pipeline (when `flatten=true`):
 
 ### Checkboxes
 
-- [ ] `flatten_pdf_to_scanned` implemented in `pdf.rs`
-- [ ] Display-orientation handling verified for `/Rotate` ∈ {0°, 90°, 180°, 270°}
-- [ ] `stamp_pdfs` accepts and threads the `flatten` flag
-- [ ] `stampAllPdfs` IPC wrapper updated
-- [ ] `stamp-store` has `flatten` (default `true`) + setter
-- [ ] `stamp-controls.tsx` toggle wired
-- [ ] All five Rust tests above written and passing
-- [ ] Existing `cargo test` suite green
-- [ ] `npx tsc --noEmit` clean
-- [ ] WPS smoke test passes (stamp uneditable when flatten=on)
+- [x] `flatten_pdf_to_scanned` implemented in `pdf.rs`
+- [x] Display-orientation handling verified for `/Rotate` ∈ {0°, 90°, 180°, 270°}
+- [x] `stamp_pdfs` accepts and threads the `flatten` flag
+- [x] `stampAllPdfs` IPC wrapper updated
+- [x] `stamp-store` has `flatten` (default `true`) + setter
+- [x] `stamp-controls.tsx` toggle wired
+- [x] All five Rust tests above written and passing (plus 2 extra rotation cases)
+- [x] Existing `cargo test` suite green
+- [x] `npx tsc --noEmit` clean
+- [ ] WPS smoke test passes (stamp uneditable when flatten=on) _(needs the user — can't drive WPS from here)_
+
+**Status**: 45 Rust tests + 76 vitest + tsc all green. `flatten_pdf_to_scanned` renders display-orientation bitmap via pdfium at 300 DPI, JPEG q=92 (`image::codecs::jpeg::JpegEncoder`), then `build_scanned_pdf` emits a fresh single-page PDF with one `/DCTDecode` Image XObject, MediaBox in display dims, no /Rotate. UI checkbox defaults ON; pipes through `stamp-store.flatten` → `stampAllPdfs` → `stamp_pdfs` → `run_stamp_jobs(flatten)`.
 
 ---
 

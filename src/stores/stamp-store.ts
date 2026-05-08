@@ -64,6 +64,9 @@ interface StampStore {
   isPlaced: boolean;
   isExporting: boolean;
   exportProgress: { current: number; total: number };
+  /** When true, exports are rasterized + re-emitted as a single Image XObject
+   * so the stamp can't be moved by downstream PDF editors. UI default is on. */
+  flatten: boolean;
 
   /** Returns the merged StampConfig for `pdfId`: default fields with any
    * override fields layered on top. Override-less PDFs get a copy of default. */
@@ -82,6 +85,7 @@ interface StampStore {
   setPlaced: (placed: boolean) => void;
   setExporting: (exporting: boolean) => void;
   setExportProgress: (current: number, total: number) => void;
+  setFlatten: (flatten: boolean) => void;
 
   // Shim setters — write to defaultConfig. Used for global stamp setup
   // (image / text / color / font / lockAspect) where per-PDF overrides don't
@@ -106,6 +110,7 @@ export const useStampStore = create<StampStore>((set, get) => ({
   isPlaced: false,
   isExporting: false,
   exportProgress: { current: 0, total: 0 },
+  flatten: true,
 
   getEffectiveConfig: (pdfId) => {
     const { defaultConfig, overrides } = get();
@@ -159,6 +164,7 @@ export const useStampStore = create<StampStore>((set, get) => ({
   setExporting: (exporting) => set({ isExporting: exporting }),
   setExportProgress: (current, total) =>
     set({ exportProgress: { current, total } }),
+  setFlatten: (flatten) => set({ flatten }),
 
   setType: (type) => get().setDefault({ type }),
   setImage: (path, previewUrl) =>

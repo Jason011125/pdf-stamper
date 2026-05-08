@@ -64,7 +64,8 @@ pub async fn stamp_pdfs(
     jobs: Vec<crate::pdf::StampJob>,
     output_dir: String,
     skip_indices: Option<Vec<usize>>,
+    flatten: bool,
 ) -> Result<Vec<String>, String> {
     let skip = skip_indices.unwrap_or_default();
-    crate::pdf::run_stamp_jobs(&jobs, &output_dir, &skip).map_err(|e| e.to_string())
+    crate::pdf::run_stamp_jobs(&jobs, &output_dir, &skip, flatten).map_err(|e| e.to_string())
 }

@@ -111,6 +111,7 @@ pub fn run_stamp_jobs(
     jobs: &[StampJob],
     output_dir: &str,
     skip_indices: &[usize],
+    flatten: bool,
 ) -> Result<Vec<String>, PdfError> {
     let mut image_cache: std::collections::HashMap<String, Vec<u8>> =
         std::collections::HashMap::new();
@@ -130,23 +131,28 @@ pub fn run_stamp_jobs(
     stamp_paths_to_disk(&paths, skip_indices, output_dir, |idx, pdf_bytes| {
         let job = &jobs[idx];
         let rot = job.rotation_deg.unwrap_or(0.0);
-        match job.stamp_type.as_str() {
+        let stamped = match job.stamp_type.as_str() {
             "image" => {
                 let img = job
                     .image_path
                     .as_deref()
                     .and_then(|p| image_cache.get(p))
                     .ok_or_else(|| PdfError::StampError("No image data provided".into()))?;
-                stamp_image(pdf_bytes, img, job.x, job.y, job.width, job.height, rot)
+                stamp_image(pdf_bytes, img, job.x, job.y, job.width, job.height, rot)?
             }
             "text" => {
                 let txt = job.text.as_deref().unwrap_or("STAMP");
                 let size = job.font_size.unwrap_or(24.0);
                 let font = job.font_name.as_deref().unwrap_or("Helvetica");
                 let rgb = job.color.as_deref().and_then(parse_hex_color);
-                stamp_text(pdf_bytes, txt, job.x, job.y, size, font, rgb)
+                stamp_text(pdf_bytes, txt, job.x, job.y, size, font, rgb)?
             }
-            other => Err(PdfError::StampError(format!("Unknown stamp type: {}", other))),
+            other => return Err(PdfError::StampError(format!("Unknown stamp type: {}", other))),
+        };
+        if flatten {
+            flatten_pdf_to_scanned(&stamped, FLATTEN_DEFAULT_DPI, FLATTEN_DEFAULT_JPEG_QUALITY)
+        } else {
+            Ok(stamped)
         }
     })
 }
@@ -378,6 +384,160 @@ pub fn render_page_to_png(pdf_bytes: &[u8], target_width: u16) -> Result<Vec<u8>
     .map_err(|e| PdfError::RenderError(e.to_string()))?;
 
     Ok(png_bytes)
+}
+
+/// Default DPI for the flatten-to-scanned export path. 300 is print-grade and
+/// matches what most "scan to PDF" tools produce. Bumped via the IPC arg if
+/// the frontend wants to expose the dial later.
+pub const FLATTEN_DEFAULT_DPI: f32 = 300.0;
+/// Default JPEG quality (0–100) for flattened pages. 92 is high enough that
+/// thin lines and small text on engineering drawings stay legible while
+/// keeping the output around 300 KB – 2 MB for a typical A4 page.
+pub const FLATTEN_DEFAULT_JPEG_QUALITY: u8 = 92;
+
+/// Rasterize the first page of `stamped_bytes` at `dpi` and return a fresh
+/// single-page PDF whose only content is that raster (JPEG encoded at
+/// `jpeg_quality`). The result has no Form XObjects — editors like WPS
+/// "PDF Edit" can no longer manipulate the stamp because it's been baked
+/// into pixels alongside the original page.
+///
+/// pdfium already applies any /Rotate when it renders, so the bitmap is in
+/// **display** orientation. We carry the display dimensions through to the
+/// new PDF's MediaBox and emit no /Rotate of our own.
+pub fn flatten_pdf_to_scanned(
+    stamped_bytes: &[u8],
+    dpi: f32,
+    jpeg_quality: u8,
+) -> Result<Vec<u8>, PdfError> {
+    use pdfium_render::prelude::*;
+
+    let lib_path = pdfium_lib_path();
+    let pdfium = Pdfium::new(
+        Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(&lib_path))
+            .map_err(|e| PdfError::RenderError(e.to_string()))?,
+    );
+    let doc = pdfium
+        .load_pdf_from_byte_slice(stamped_bytes, None)
+        .map_err(|e| PdfError::RenderError(e.to_string()))?;
+    let page = doc
+        .pages()
+        .get(0)
+        .map_err(|e| PdfError::RenderError(e.to_string()))?;
+
+    let display_w_pt = page.width().value;
+    let display_h_pt = page.height().value;
+    let target_w_px = ((display_w_pt * dpi / 72.0).ceil() as i32).max(1);
+    let config = PdfRenderConfig::new().set_target_width(target_w_px);
+    let bitmap = page
+        .render_with_config(&config)
+        .map_err(|e| PdfError::RenderError(e.to_string()))?;
+    let rgba = bitmap.as_image().to_rgba8();
+    let (px_w, px_h) = (rgba.width(), rgba.height());
+
+    // pdfium clears the bitmap to white-opaque by default, so this loop is
+    // usually a no-op alpha-wise. Cheap insurance if that ever changes.
+    let mut rgb = Vec::with_capacity((px_w as usize) * (px_h as usize) * 3);
+    for px in rgba.pixels() {
+        let a = px[3] as u32;
+        let inv = 255 - a;
+        rgb.push(((px[0] as u32 * a + 255 * inv) / 255) as u8);
+        rgb.push(((px[1] as u32 * a + 255 * inv) / 255) as u8);
+        rgb.push(((px[2] as u32 * a + 255 * inv) / 255) as u8);
+    }
+
+    let mut jpeg = Vec::new();
+    {
+        use image::codecs::jpeg::JpegEncoder;
+        use image::ImageEncoder;
+        JpegEncoder::new_with_quality(&mut jpeg, jpeg_quality)
+            .write_image(&rgb, px_w, px_h, image::ExtendedColorType::Rgb8)
+            .map_err(|e| PdfError::StampError(e.to_string()))?;
+    }
+
+    build_scanned_pdf(&jpeg, px_w as i64, px_h as i64, display_w_pt, display_h_pt)
+}
+
+/// Build a minimal single-page PDF whose only content is `jpeg_bytes` painted
+/// across the entire MediaBox. Output has no /Rotate — the caller is expected
+/// to pass display-space dimensions.
+fn build_scanned_pdf(
+    jpeg_bytes: &[u8],
+    pixel_w: i64,
+    pixel_h: i64,
+    page_w_pt: f32,
+    page_h_pt: f32,
+) -> Result<Vec<u8>, PdfError> {
+    let mut doc = Document::with_version("1.7");
+
+    let mut img_dict = Dictionary::new();
+    img_dict.set("Type", Name(b"XObject".to_vec()));
+    img_dict.set("Subtype", Name(b"Image".to_vec()));
+    img_dict.set("Width", Object::Integer(pixel_w));
+    img_dict.set("Height", Object::Integer(pixel_h));
+    img_dict.set("ColorSpace", Name(b"DeviceRGB".to_vec()));
+    img_dict.set("BitsPerComponent", Object::Integer(8));
+    img_dict.set("Filter", Name(b"DCTDecode".to_vec()));
+    let img_id = doc.add_object(Stream::new(img_dict, jpeg_bytes.to_vec()));
+
+    let content_data = Content {
+        operations: vec![
+            Operation::new("q", vec![]),
+            Operation::new(
+                "cm",
+                vec![
+                    page_w_pt.into(), 0.0f32.into(), 0.0f32.into(),
+                    page_h_pt.into(), 0.0f32.into(), 0.0f32.into(),
+                ],
+            ),
+            Operation::new("Do", vec![Name(b"Im0".to_vec())]),
+            Operation::new("Q", vec![]),
+        ],
+    }
+    .encode()
+    .map_err(|e| PdfError::StampError(e.to_string()))?;
+    let content_id = doc.add_object(Stream::new(Dictionary::new(), content_data));
+
+    let mut xobj_dict = Dictionary::new();
+    xobj_dict.set("Im0", Object::Reference(img_id));
+    let mut resources = Dictionary::new();
+    resources.set("XObject", Object::Dictionary(xobj_dict));
+
+    let mut page_dict = Dictionary::new();
+    page_dict.set("Type", Name(b"Page".to_vec()));
+    page_dict.set(
+        "MediaBox",
+        Object::Array(vec![
+            0.0f32.into(), 0.0f32.into(),
+            page_w_pt.into(), page_h_pt.into(),
+        ]),
+    );
+    page_dict.set("Contents", Object::Reference(content_id));
+    page_dict.set("Resources", Object::Dictionary(resources));
+    let page_id = doc.add_object(Object::Dictionary(page_dict));
+
+    let mut pages_dict = Dictionary::new();
+    pages_dict.set("Type", Name(b"Pages".to_vec()));
+    pages_dict.set("Count", Object::Integer(1));
+    pages_dict.set("Kids", Object::Array(vec![Object::Reference(page_id)]));
+    let pages_id = doc.add_object(Object::Dictionary(pages_dict));
+
+    doc.get_object_mut(page_id)
+        .map_err(|e| PdfError::StampError(e.to_string()))?
+        .as_dict_mut()
+        .map_err(|e| PdfError::StampError(e.to_string()))?
+        .set("Parent", Object::Reference(pages_id));
+
+    let mut catalog = Dictionary::new();
+    catalog.set("Type", Name(b"Catalog".to_vec()));
+    catalog.set("Pages", Object::Reference(pages_id));
+    let catalog_id = doc.add_object(Object::Dictionary(catalog));
+
+    doc.trailer.set("Root", Object::Reference(catalog_id));
+
+    let mut output = Vec::new();
+    doc.save_to(&mut output)
+        .map_err(|e| PdfError::StampError(e.to_string()))?;
+    Ok(output)
 }
 
 // 2D affine matrix in PDF cm form: [a, b, c, d, e, f] representing the
@@ -2535,7 +2695,7 @@ mod tests {
             .collect();
 
         let written =
-            run_stamp_jobs(&jobs, out_dir.to_str().unwrap(), &[]).unwrap();
+            run_stamp_jobs(&jobs, out_dir.to_str().unwrap(), &[], false).unwrap();
         assert_eq!(written.len(), 3);
 
         for (out_path, (x, y, w, h, rot)) in written.iter().zip(&placements) {
@@ -2547,6 +2707,199 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&in_dir);
         let _ = std::fs::remove_dir_all(&out_dir);
+    }
+
+    // -- Tests: flatten_pdf_to_scanned --------------------------------------
+
+    /// Walk a Document and return Image XObject and Form XObject counts.
+    fn xobject_subtype_counts(doc: &Document) -> (usize, usize) {
+        let mut images = 0usize;
+        let mut forms = 0usize;
+        for (_id, obj) in &doc.objects {
+            if let Object::Stream(s) = obj {
+                if let Ok(Name(n)) = s.dict.get(b"Subtype") {
+                    if n == b"Image" {
+                        images += 1;
+                    } else if n == b"Form" {
+                        forms += 1;
+                    }
+                }
+            }
+        }
+        (images, forms)
+    }
+
+    /// Read the first page's MediaBox as (w, h) in points.
+    fn first_page_mediabox(pdf_bytes: &[u8]) -> (f32, f32) {
+        let doc = Document::load_mem(pdf_bytes).expect("parse flattened PDF");
+        let page_id = doc.page_iter().next().expect("PDF must have one page");
+        let dict = doc.get_object(page_id).unwrap().as_dict().unwrap();
+        let mb = dict.get(b"MediaBox").unwrap().as_array().unwrap();
+        let w = obj_as_f32(&mb[2]).unwrap();
+        let h = obj_as_f32(&mb[3]).unwrap();
+        (w, h)
+    }
+
+    /// True if the first page carries a non-zero /Rotate entry.
+    fn first_page_has_rotate(pdf_bytes: &[u8]) -> bool {
+        let doc = Document::load_mem(pdf_bytes).expect("parse flattened PDF");
+        let page_id = doc.page_iter().next().expect("PDF must have one page");
+        let dict = doc.get_object(page_id).unwrap().as_dict().unwrap();
+        match dict.get(b"Rotate") {
+            Ok(o) => o.as_i64().unwrap_or(0) != 0,
+            Err(_) => false,
+        }
+    }
+
+    #[test]
+    fn flatten_output_has_no_form_xobject() {
+        let pdf = make_test_pdf(200.0, 300.0, None);
+        let png = make_red_png();
+        let stamped = stamp_image(&pdf, &png, 50.0, 60.0, 80.0, 90.0, 0.0).unwrap();
+        let flat = flatten_pdf_to_scanned(&stamped, 100.0, 90).unwrap();
+
+        let doc = Document::load_mem(&flat).expect("parse flattened PDF");
+        let (images, forms) = xobject_subtype_counts(&doc);
+        assert_eq!(forms, 0, "flattened PDF must have no Form XObject");
+        assert_eq!(images, 1, "flattened PDF must have exactly one Image XObject");
+    }
+
+    #[test]
+    fn flatten_output_image_uses_dct_filter() {
+        let pdf = make_test_pdf(200.0, 300.0, None);
+        let png = make_red_png();
+        let stamped = stamp_image(&pdf, &png, 50.0, 60.0, 80.0, 90.0, 0.0).unwrap();
+        let flat = flatten_pdf_to_scanned(&stamped, 100.0, 90).unwrap();
+
+        let doc = Document::load_mem(&flat).expect("parse flattened PDF");
+        for (_id, obj) in &doc.objects {
+            if let Object::Stream(s) = obj {
+                if let Ok(Name(n)) = s.dict.get(b"Subtype") {
+                    if n == b"Image" {
+                        let filter = s.dict.get(b"Filter").unwrap();
+                        if let Name(f) = filter {
+                            assert_eq!(f.as_slice(), b"DCTDecode");
+                            return;
+                        }
+                        panic!("/Filter must be a Name, got {:?}", filter);
+                    }
+                }
+            }
+        }
+        panic!("no Image XObject found in flattened PDF");
+    }
+
+    #[test]
+    fn flatten_preserves_display_dimensions_no_rotate() {
+        let pdf = make_test_pdf(595.0, 842.0, None);
+        let png = make_red_png();
+        let stamped = stamp_image(&pdf, &png, 100.0, 200.0, 50.0, 60.0, 0.0).unwrap();
+        let flat = flatten_pdf_to_scanned(&stamped, 100.0, 90).unwrap();
+
+        let (w, h) = first_page_mediabox(&flat);
+        assert!((w - 595.0).abs() < 1.0, "MediaBox width {} should be ~595", w);
+        assert!((h - 842.0).abs() < 1.0, "MediaBox height {} should be ~842", h);
+        assert!(!first_page_has_rotate(&flat), "flattened page must not carry /Rotate");
+    }
+
+    #[test]
+    fn flatten_preserves_display_dimensions_with_rotate_180() {
+        // 180° doesn't swap axes — display dims equal raw dims.
+        let pdf = make_test_pdf(595.0, 842.0, Some(180));
+        let png = make_red_png();
+        let stamped = stamp_image(&pdf, &png, 100.0, 200.0, 50.0, 60.0, 0.0).unwrap();
+        let flat = flatten_pdf_to_scanned(&stamped, 100.0, 90).unwrap();
+
+        let (w, h) = first_page_mediabox(&flat);
+        assert!((w - 595.0).abs() < 1.0, "MediaBox width {} should be ~595", w);
+        assert!((h - 842.0).abs() < 1.0, "MediaBox height {} should be ~842", h);
+        assert!(!first_page_has_rotate(&flat), "flattened page must not carry /Rotate");
+    }
+
+    #[test]
+    fn flatten_preserves_display_dimensions_with_rotate_270() {
+        // 270° swaps axes — same shape as the 90° case structurally.
+        let pdf = make_test_pdf(595.0, 842.0, Some(270));
+        let png = make_red_png();
+        let stamped = stamp_image(&pdf, &png, 100.0, 200.0, 50.0, 60.0, 0.0).unwrap();
+        let flat = flatten_pdf_to_scanned(&stamped, 100.0, 90).unwrap();
+
+        let (w, h) = first_page_mediabox(&flat);
+        assert!((w - 842.0).abs() < 1.0, "MediaBox width {} should be ~842 (display)", w);
+        assert!((h - 595.0).abs() < 1.0, "MediaBox height {} should be ~595 (display)", h);
+        assert!(!first_page_has_rotate(&flat), "flattened page must not carry /Rotate");
+    }
+
+    #[test]
+    fn flatten_preserves_display_dimensions_with_rotate_90() {
+        // Source: 595×842 portrait + /Rotate 90 → display is 842×595 landscape.
+        // Output MediaBox should match the *display* (842×595), no /Rotate.
+        let pdf = make_test_pdf(595.0, 842.0, Some(90));
+        let png = make_red_png();
+        let stamped = stamp_image(&pdf, &png, 100.0, 200.0, 50.0, 60.0, 0.0).unwrap();
+        let flat = flatten_pdf_to_scanned(&stamped, 100.0, 90).unwrap();
+
+        let (w, h) = first_page_mediabox(&flat);
+        assert!((w - 842.0).abs() < 1.0, "MediaBox width {} should be ~842 (display)", w);
+        assert!((h - 595.0).abs() < 1.0, "MediaBox height {} should be ~595 (display)", h);
+        assert!(!first_page_has_rotate(&flat), "flattened page must not carry /Rotate");
+    }
+
+    #[test]
+    fn flatten_visual_smoke_red_stamp() {
+        // Stamp a red square at a known display-space rectangle, flatten,
+        // render the flat output back, locate the red bbox, and assert it
+        // sits where the original stamp was (no rotation, identity mapping).
+        let raw_w = 400.0_f32;
+        let raw_h = 600.0_f32;
+        let dx = 80.0_f32;
+        let dy = 100.0_f32;
+        let w = 120.0_f32;
+        let h = 80.0_f32;
+
+        let pdf = make_test_pdf(raw_w, raw_h, None);
+        let png = make_red_png();
+        let stamped = stamp_image(&pdf, &png, dx, dy, w, h, 0.0).unwrap();
+        let flat = flatten_pdf_to_scanned(&stamped, 200.0, 95).unwrap();
+
+        let target_w: u16 = 800;
+        let ((rx_min, rx_max), (ry_min, ry_max)) = red_bbox_in_render(&flat, target_w);
+
+        // Display-space → render-pixel mapping. No page rotation, so display
+        // rect is x ∈ [dx, dx+w], y_display_top ∈ [raw_h - (dy+h), raw_h - dy]
+        // (display Y measured from top of image; PDF Y measured from bottom).
+        let scale = target_w as f32 / raw_w;
+        let display_h_px = raw_h * scale;
+        let exp_x_min = dx * scale;
+        let exp_x_max = (dx + w) * scale;
+        let exp_y_min = display_h_px - (dy + h) * scale;
+        let exp_y_max = display_h_px - dy * scale;
+
+        let tol = 6.0_f32; // a few pixels for JPEG edge softness + render rounding
+        assert!(
+            (rx_min as f32 - exp_x_min).abs() < tol,
+            "red x_min {} vs expected {}",
+            rx_min,
+            exp_x_min,
+        );
+        assert!(
+            (rx_max as f32 - exp_x_max).abs() < tol,
+            "red x_max {} vs expected {}",
+            rx_max,
+            exp_x_max,
+        );
+        assert!(
+            (ry_min as f32 - exp_y_min).abs() < tol,
+            "red y_min {} vs expected {}",
+            ry_min,
+            exp_y_min,
+        );
+        assert!(
+            (ry_max as f32 - exp_y_max).abs() < tol,
+            "red y_max {} vs expected {}",
+            ry_max,
+            exp_y_max,
+        );
     }
 
     /// run_stamp_jobs respects skip_indices (skipped jobs produce no output).
@@ -2573,7 +2926,7 @@ mod tests {
             .collect();
 
         let written =
-            run_stamp_jobs(&jobs, out_dir.to_str().unwrap(), &[1]).unwrap();
+            run_stamp_jobs(&jobs, out_dir.to_str().unwrap(), &[1], false).unwrap();
         assert_eq!(written.len(), 2);
         assert!(written[0].ends_with("a.pdf"));
         assert!(written[1].ends_with("c.pdf"));
