@@ -13,8 +13,6 @@ import { open } from '@tauri-apps/plugin-dialog';
 import { invoke } from '@tauri-apps/api/core';
 import { ConflictDialog } from './conflict-dialog';
 
-const STAMP_SUFFIX = '-stamped';
-
 async function readImagePreview(path: string): Promise<string> {
   const bytes = await invoke<number[]>('read_file_bytes', { path });
   const uint8 = new Uint8Array(bytes);
@@ -217,7 +215,6 @@ export function StampControls(): React.JSX.Element {
     const conflicts = await checkOutputConflicts(
       files.map((f) => ({ path: f.path })),
       dir,
-      STAMP_SUFFIX,
     );
 
     if (conflicts.length === 0) {

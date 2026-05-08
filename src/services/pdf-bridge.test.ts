@@ -23,36 +23,33 @@ describe('checkOutputConflicts', () => {
     invokeMock.mockReset();
   });
 
-  it('forwards inputs/outputDir/suffix to the Rust command with camelCase keys', async () => {
+  it('forwards inputs/outputDir to the Rust command with camelCase keys', async () => {
     invokeMock.mockResolvedValueOnce([]);
     await checkOutputConflicts(
       [{ path: '/a.pdf' }, { path: '/b.pdf' }],
       '/out',
-      '-stamped',
     );
     expect(invokeMock).toHaveBeenCalledWith('check_output_conflicts', {
       inputs: [{ path: '/a.pdf' }, { path: '/b.pdf' }],
       outputDir: '/out',
-      suffix: '-stamped',
     });
   });
 
   it('returns the parsed Conflict[] response shape (snake_case output_path)', async () => {
     const fakeResponse: Conflict[] = [
-      { idx: 0, output_path: '/out/a-stamped.pdf' },
-      { idx: 2, output_path: '/out/c-stamped.pdf' },
+      { idx: 0, output_path: '/out/a.pdf' },
+      { idx: 2, output_path: '/out/c.pdf' },
     ];
     invokeMock.mockResolvedValueOnce(fakeResponse);
 
     const result = await checkOutputConflicts(
       [{ path: '/a.pdf' }, { path: '/b.pdf' }, { path: '/c.pdf' }],
       '/out',
-      '-stamped',
     );
 
     expect(result).toEqual(fakeResponse);
     expect(result[0]?.idx).toBe(0);
-    expect(result[0]?.output_path).toBe('/out/a-stamped.pdf');
+    expect(result[0]?.output_path).toBe('/out/a.pdf');
     expect(result[1]?.idx).toBe(2);
   });
 });

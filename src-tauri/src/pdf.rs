@@ -5,9 +5,6 @@ use lopdf::{Dictionary, Document, Object, Stream};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// Suffix appended to a PDF's file stem when computing its stamped output path.
-pub const STAMP_SUFFIX: &str = "-stamped";
-
 #[derive(Error, Debug)]
 pub enum PdfError {
     #[error("failed to load PDF: {0}")]
@@ -26,15 +23,37 @@ pub struct ConflictEntry {
     pub output_path: String,
 }
 
-/// Compute the stamped-output path for a single input PDF, mirroring the
-/// naming used by `stamp_pdfs` (input stem + suffix + ".pdf", under
-/// `output_dir`). Kept pure / no I/O so it's trivially testable.
-pub fn compute_output_path(input_path: &str, output_dir: &str, suffix: &str) -> String {
+/// Compute the output path for a single input PDF: `<output_dir>/<stem>.pdf`.
+/// Pure / no I/O — trivially testable.
+pub fn compute_output_path(input_path: &str, output_dir: &str) -> String {
     let stem = std::path::Path::new(input_path)
         .file_stem()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "output".into());
-    format!("{}/{}{}.pdf", output_dir, stem, suffix)
+    format!("{}/{}.pdf", output_dir, stem)
+}
+
+/// Compute output paths for a batch of inputs, deduping same-basename
+/// collisions in input order: the first input keeps its bare name, subsequent
+/// duplicates get ` (2)`, ` (3)`, ... appended to the stem.
+pub fn compute_output_paths(input_paths: &[String], output_dir: &str) -> Vec<String> {
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut out = Vec::with_capacity(input_paths.len());
+    for path in input_paths {
+        let stem = std::path::Path::new(path)
+            .file_stem()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "output".into());
+        let n = counts.entry(stem.clone()).or_insert(0);
+        *n += 1;
+        let name = if *n == 1 {
+            format!("{}.pdf", stem)
+        } else {
+            format!("{} ({}).pdf", stem, n)
+        };
+        out.push(format!("{}/{}", output_dir, name));
+    }
+    out
 }
 
 /// Return the indices and output paths of inputs whose computed output path
@@ -43,13 +62,11 @@ pub fn compute_output_path(input_path: &str, output_dir: &str, suffix: &str) -> 
 pub fn check_output_conflicts(
     input_paths: &[String],
     output_dir: &str,
-    suffix: &str,
 ) -> Vec<ConflictEntry> {
-    input_paths
-        .iter()
+    compute_output_paths(input_paths, output_dir)
+        .into_iter()
         .enumerate()
-        .filter_map(|(idx, p)| {
-            let output_path = compute_output_path(p, output_dir, suffix);
+        .filter_map(|(idx, output_path)| {
             if std::path::Path::new(&output_path).exists() {
                 Some(ConflictEntry { idx, output_path })
             } else {
@@ -83,7 +100,8 @@ pub struct StampJob {
 
 /// Run a batch of per-PDF stamp jobs to disk. Reads each distinct image
 /// once (cached by path), then applies the per-job stamp_image / stamp_text
-/// to each input, writing each output to `output_dir/<stem><suffix>.pdf`.
+/// to each input, writing each output to `output_dir/<stem>.pdf` (with
+/// same-basename collisions deduped by `compute_output_paths`).
 /// Indices in `skip_indices` are skipped (no file written for those jobs).
 ///
 /// This is the non-async core of `commands::stamp_pdfs`; the Tauri handler
@@ -109,7 +127,7 @@ pub fn run_stamp_jobs(
 
     let paths: Vec<String> = jobs.iter().map(|j| j.path.clone()).collect();
 
-    stamp_paths_to_disk(&paths, skip_indices, output_dir, STAMP_SUFFIX, |idx, pdf_bytes| {
+    stamp_paths_to_disk(&paths, skip_indices, output_dir, |idx, pdf_bytes| {
         let job = &jobs[idx];
         let rot = job.rotation_deg.unwrap_or(0.0);
         match job.stamp_type.as_str() {
@@ -135,7 +153,9 @@ pub fn run_stamp_jobs(
 
 /// Iterate `paths`, skipping any whose index is in `skip_indices`, applying
 /// `stamp_fn` to the bytes of each surviving file, and writing the result to
-/// `output_dir/<stem><suffix>.pdf`. Returns the list of written output paths.
+/// `output_dir/<stem>.pdf` (with same-basename collisions deduped via
+/// `compute_output_paths`). Refuses up-front if any computed output would
+/// overwrite its input — this would silently destroy the source PDF.
 ///
 /// Extracted from `commands::stamp_pdfs` so the skip-list semantics are
 /// testable without spinning up Tauri.
@@ -143,25 +163,54 @@ pub fn stamp_paths_to_disk<F>(
     paths: &[String],
     skip_indices: &[usize],
     output_dir: &str,
-    suffix: &str,
     mut stamp_fn: F,
 ) -> Result<Vec<String>, PdfError>
 where
     F: FnMut(usize, &[u8]) -> Result<Vec<u8>, PdfError>,
 {
+    let output_paths = compute_output_paths(paths, output_dir);
+
+    for (input, output) in paths.iter().zip(output_paths.iter()) {
+        if would_overwrite_input(input, output) {
+            return Err(PdfError::StampError(format!(
+                "Output directory must differ from the source — would overwrite `{}`",
+                input
+            )));
+        }
+    }
+
     let skip_set: std::collections::HashSet<usize> = skip_indices.iter().copied().collect();
-    let mut output_paths = Vec::new();
-    for (idx, path) in paths.iter().enumerate() {
+    let mut written = Vec::new();
+    for (idx, (path, out)) in paths.iter().zip(output_paths.iter()).enumerate() {
         if skip_set.contains(&idx) {
             continue;
         }
         let pdf_bytes = std::fs::read(path)?;
         let stamped = stamp_fn(idx, &pdf_bytes)?;
-        let out = compute_output_path(path, output_dir, suffix);
-        std::fs::write(&out, &stamped)?;
-        output_paths.push(out);
+        std::fs::write(out, &stamped)?;
+        written.push(out.clone());
     }
-    Ok(output_paths)
+    Ok(written)
+}
+
+// Compares canonical absolute paths so trailing slashes, relative paths, and
+// symlinks all resolve correctly. Returns false if either side can't be
+// canonicalized — the subsequent write will surface any real error.
+fn would_overwrite_input(input: &str, output: &str) -> bool {
+    let in_canon = match std::fs::canonicalize(input) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let out_path = std::path::Path::new(output);
+    let parent = match out_path.parent().and_then(|p| std::fs::canonicalize(p).ok()) {
+        Some(p) => p,
+        None => return false,
+    };
+    let name = match out_path.file_name() {
+        Some(n) => n,
+        None => return false,
+    };
+    in_canon == parent.join(name)
 }
 
 /// Parse a PDF object as f32, handling both Real and Integer types.
@@ -2228,9 +2277,31 @@ mod tests {
     }
 
     #[test]
-    fn compute_output_path_uses_stem_and_suffix() {
-        let p = compute_output_path("/some/dir/example.pdf", "/out", "-stamped");
-        assert_eq!(p, "/out/example-stamped.pdf");
+    fn output_filename_drops_stamped_suffix() {
+        let p = compute_output_path("/some/dir/example.pdf", "/out");
+        assert_eq!(p, "/out/example.pdf");
+    }
+
+    #[test]
+    fn output_filename_dedups_same_basename() {
+        // Three inputs sharing a basename across different folders — second
+        // and third get " (2)" / " (3)" appended in input order.
+        let inputs = vec![
+            "/a/foo.pdf".to_string(),
+            "/b/foo.pdf".to_string(),
+            "/c/foo.pdf".to_string(),
+            "/d/bar.pdf".to_string(),
+        ];
+        let out = compute_output_paths(&inputs, "/out");
+        assert_eq!(
+            out,
+            vec![
+                "/out/foo.pdf".to_string(),
+                "/out/foo (2).pdf".to_string(),
+                "/out/foo (3).pdf".to_string(),
+                "/out/bar.pdf".to_string(),
+            ],
+        );
     }
 
     #[test]
@@ -2244,18 +2315,16 @@ mod tests {
             "/anywhere/gamma.pdf".to_string(),
         ];
 
-        // Pre-create alpha-stamped.pdf and gamma-stamped.pdf in out_dir.
-        std::fs::write(out_dir.join("alpha-stamped.pdf"), b"existing").unwrap();
-        std::fs::write(out_dir.join("gamma-stamped.pdf"), b"existing").unwrap();
+        std::fs::write(out_dir.join("alpha.pdf"), b"existing").unwrap();
+        std::fs::write(out_dir.join("gamma.pdf"), b"existing").unwrap();
 
-        let conflicts =
-            check_output_conflicts(&inputs, out_dir.to_str().unwrap(), STAMP_SUFFIX);
+        let conflicts = check_output_conflicts(&inputs, out_dir.to_str().unwrap());
 
         assert_eq!(conflicts.len(), 2);
         assert_eq!(conflicts[0].idx, 0);
-        assert!(conflicts[0].output_path.ends_with("alpha-stamped.pdf"));
+        assert!(conflicts[0].output_path.ends_with("alpha.pdf"));
         assert_eq!(conflicts[1].idx, 2);
-        assert!(conflicts[1].output_path.ends_with("gamma-stamped.pdf"));
+        assert!(conflicts[1].output_path.ends_with("gamma.pdf"));
 
         let _ = std::fs::remove_dir_all(&out_dir);
     }
@@ -2264,10 +2333,42 @@ mod tests {
     fn check_output_conflicts_returns_empty_when_no_conflicts() {
         let out_dir = make_tempdir("noconflicts");
         let inputs = vec!["/anywhere/lonely.pdf".to_string()];
-        let conflicts =
-            check_output_conflicts(&inputs, out_dir.to_str().unwrap(), STAMP_SUFFIX);
+        let conflicts = check_output_conflicts(&inputs, out_dir.to_str().unwrap());
         assert!(conflicts.is_empty());
         let _ = std::fs::remove_dir_all(&out_dir);
+    }
+
+    #[test]
+    fn stamp_pdfs_refuses_to_overwrite_input() {
+        // Output dir == input dir → bare-stem output collides with the source.
+        let dir = make_tempdir("overwrite-guard");
+        let in_path = dir.join("doc.pdf");
+        std::fs::write(&in_path, b"ORIGINAL").unwrap();
+        let in_str = in_path.to_str().unwrap().to_string();
+
+        let result = stamp_paths_to_disk(
+            &[in_str],
+            &[],
+            dir.to_str().unwrap(),
+            |_idx, _bytes| Ok(b"REPLACED".to_vec()),
+        );
+
+        match result {
+            Err(PdfError::StampError(msg)) => {
+                assert!(
+                    msg.contains("would overwrite"),
+                    "error should mention overwrite, got: {}",
+                    msg,
+                );
+            }
+            other => panic!("expected StampError, got {:?}", other),
+        }
+
+        // Source PDF must be untouched on disk.
+        let body = std::fs::read(&in_path).unwrap();
+        assert_eq!(body, b"ORIGINAL");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2289,7 +2390,6 @@ mod tests {
             &input_paths,
             &[1],
             out_dir.to_str().unwrap(),
-            STAMP_SUFFIX,
             |idx, bytes| {
                 seen_indices.push(idx);
                 let mut v = bytes.to_vec();
@@ -2302,16 +2402,16 @@ mod tests {
         // Only indices 0 and 2 should have been processed/written.
         assert_eq!(seen_indices, vec![0, 2]);
         assert_eq!(written.len(), 2);
-        assert!(written[0].ends_with("one-stamped.pdf"));
-        assert!(written[1].ends_with("three-stamped.pdf"));
+        assert!(written[0].ends_with("one.pdf"));
+        assert!(written[1].ends_with("three.pdf"));
 
         // Outputs exist on disk.
-        assert!(out_dir.join("one-stamped.pdf").exists());
-        assert!(out_dir.join("three-stamped.pdf").exists());
-        assert!(!out_dir.join("two-stamped.pdf").exists());
+        assert!(out_dir.join("one.pdf").exists());
+        assert!(out_dir.join("three.pdf").exists());
+        assert!(!out_dir.join("two.pdf").exists());
 
         // Verify the no-op stamper was actually applied.
-        let body = std::fs::read(out_dir.join("one-stamped.pdf")).unwrap();
+        let body = std::fs::read(out_dir.join("one.pdf")).unwrap();
         assert_eq!(body, b"INPUT-one-STAMPED");
 
         let _ = std::fs::remove_dir_all(&in_dir);
@@ -2331,13 +2431,12 @@ mod tests {
             &input_paths,
             &[],
             out_dir.to_str().unwrap(),
-            STAMP_SUFFIX,
             |_idx, bytes| Ok(bytes.to_vec()),
         )
         .unwrap();
 
         assert_eq!(written.len(), 1);
-        assert!(written[0].ends_with("doc-stamped.pdf"));
+        assert!(written[0].ends_with("doc.pdf"));
 
         let _ = std::fs::remove_dir_all(&in_dir);
         let _ = std::fs::remove_dir_all(&out_dir);
@@ -2476,9 +2575,9 @@ mod tests {
         let written =
             run_stamp_jobs(&jobs, out_dir.to_str().unwrap(), &[1]).unwrap();
         assert_eq!(written.len(), 2);
-        assert!(written[0].ends_with("a-stamped.pdf"));
-        assert!(written[1].ends_with("c-stamped.pdf"));
-        assert!(!out_dir.join("b-stamped.pdf").exists());
+        assert!(written[0].ends_with("a.pdf"));
+        assert!(written[1].ends_with("c.pdf"));
+        assert!(!out_dir.join("b.pdf").exists());
 
         let _ = std::fs::remove_dir_all(&in_dir);
         let _ = std::fs::remove_dir_all(&out_dir);

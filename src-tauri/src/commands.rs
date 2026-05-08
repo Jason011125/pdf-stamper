@@ -54,10 +54,9 @@ pub async fn read_file_bytes(path: String) -> Result<Vec<u8>, String> {
 pub async fn check_output_conflicts(
     inputs: Vec<ConflictInput>,
     output_dir: String,
-    suffix: String,
 ) -> Result<Vec<crate::pdf::ConflictEntry>, String> {
     let paths: Vec<String> = inputs.into_iter().map(|i| i.path).collect();
-    Ok(crate::pdf::check_output_conflicts(&paths, &output_dir, &suffix))
+    Ok(crate::pdf::check_output_conflicts(&paths, &output_dir))
 }
 
 #[tauri::command]

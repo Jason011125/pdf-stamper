@@ -51,12 +51,10 @@ export type ConflictDecision = 'overwrite' | 'skip';
 export async function checkOutputConflicts(
   inputs: ConflictInput[],
   outputDir: string,
-  suffix: string,
 ): Promise<Conflict[]> {
   return invoke<Conflict[]>('check_output_conflicts', {
     inputs,
     outputDir,
-    suffix,
   });
 }
 

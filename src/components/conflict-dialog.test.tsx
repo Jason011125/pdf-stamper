@@ -144,7 +144,7 @@ describe('ConflictDialog component (US-FIX3) — no file picker on apply-all', (
   function makeConflicts(n: number): Conflict[] {
     return Array.from({ length: n }, (_, i) => ({
       idx: i,
-      output_path: `/Users/x/Downloads/file${i}-stamped.pdf`,
+      output_path: `/Users/x/Downloads/file${i}.pdf`,
     }));
   }
 
